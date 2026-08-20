@@ -299,12 +299,19 @@ jobs:
         include:
           - name: linux-x86_64
             target: x86_64-linux
+            binary: fx
           - name: linux-aarch64
             target: aarch64-linux
+            binary: fx
           - name: macos-x86_64
             target: x86_64-macos
+            binary: fx
           - name: macos-aarch64
             target: aarch64-macos
+            binary: fx
+          - name: windows-x86_64
+            target: x86_64-windows
+            binary: fx.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -319,10 +326,35 @@ jobs:
 
       - name: Report binary size
         run: |
-          bytes=$(stat -c%s zig-out/bin/fx)
+          bytes=$(stat -c%s zig-out/bin/${{ matrix.binary }})
           mib=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1048576 }')
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)"
           echo "${{ matrix.name }}: $bytes bytes ($mib MiB)" >> "$GITHUB_STEP_SUMMARY"
+
+  windows-native:
+    name: Build & Test (Windows x86_64)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+          cache-key: ci-windows-native
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Test
+        run: zig build test -Doptimize=ReleaseSafe
+
+      - name: Smoke test
+        run: |
+          .\zig-out\bin\fx.exe --version
+          .\zig-out\bin\fx.exe --help
+          .\zig-out\bin\fx.exe status
+          .\zig-out\bin\fx.exe doctor
 
   lint-scripts:
     name: Shellcheck
