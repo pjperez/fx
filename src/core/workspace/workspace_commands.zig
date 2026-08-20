@@ -599,8 +599,8 @@ test "workspace access reconciliation accepts only intended or previous saved st
 
     const previous_fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
-        .{ primary, previous },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(previous, .{}) },
     );
     defer alloc.free(previous_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", previous_fixture);
@@ -616,8 +616,8 @@ test "workspace access reconciliation accepts only intended or previous saved st
 
     const third_fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
-        .{ primary, third },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(third, .{}) },
     );
     defer alloc.free(third_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", third_fixture);
@@ -627,8 +627,8 @@ test "workspace access reconciliation accepts only intended or previous saved st
 
     const invalid_fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, previous, previous },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f},{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(previous, .{}), std.json.fmt(previous, .{}) },
     );
     defer alloc.free(invalid_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", invalid_fixture);
@@ -671,8 +671,8 @@ test "workspace access reconciliation rejects a retargeted durable source" {
 
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
-        .{ primary, source },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(source, .{}) },
     );
     defer alloc.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);

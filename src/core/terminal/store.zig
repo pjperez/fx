@@ -460,7 +460,7 @@ pub const Record = struct {
             return error.InvalidTerminalRecord;
         }
         if (self.takeover_owner_pid) |pid| {
-            _ = std.fmt.parseInt(std.posix.pid_t, pid, 10) catch
+            _ = io_mod.parsePidText(pid) catch
                 return error.InvalidTerminalRecord;
             _ = process_supervisor.ProcessInstanceToken.parse(
                 self.takeover_owner_process_token.?,
@@ -7224,12 +7224,13 @@ fn test_process_owner(
 ) !contracts.ProcessOwner {
     var pid_buffer: [32]u8 = undefined;
     const pid = std.c.getpid();
-    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid});
+    const pid_number = io_mod.pidNumber(pid);
+    const pid_text = try std.fmt.bufPrint(&pid_buffer, "{d}", .{pid_number});
     const token = try process_provider.captureToken(
         alloc,
         pid_text,
     );
-    return contracts.ProcessOwner.init(@intCast(pid), token.view());
+    return contracts.ProcessOwner.init(@intCast(pid_number), token.view());
 }
 
 test "owner catalog enumerates the exact durable owner without a terminal anchor" {
@@ -8097,7 +8098,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     );
     try proof_file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o640),
+        io_mod.permissionsFromMode(0o640),
     );
     proof_file.close(std.testing.io);
 
@@ -8120,7 +8121,7 @@ test "tmux recovery propagates proof capability failure without durable loss" {
     defer proof_file.close(std.testing.io);
     try proof_file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o600),
+        io_mod.permissionsFromMode(0o600),
     );
 
     {

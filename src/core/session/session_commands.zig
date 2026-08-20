@@ -2872,8 +2872,8 @@ test "session_commands user save notice uses one post-commit load after legacy c
     defer std.testing.allocator.free(workspace_root);
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"model\":\"user/old\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
-        .{workspace_root},
+        "{{\"model\":\"user/old\",\"workspaces\":{{{f}:{{\"model\":\"legacy/local\"}}}}}}\n",
+        .{std.json.fmt(workspace_root, .{})},
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2906,8 +2906,8 @@ test "session_commands durable user save survives post-commit resolver failure" 
     defer std.testing.allocator.free(workspace_root);
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
-        .{workspace_root},
+        "{{\"workspaces\":{{{f}:{{\"model\":\"legacy/local\"}}}}}}\n",
+        .{std.json.fmt(workspace_root, .{})},
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);

@@ -361,17 +361,18 @@ pub const Store = struct {
         errdefer durable_home.close(zio);
 
         if (mode == .writable) {
-            durable_home.setPermissions(zio, std.Io.File.Permissions.fromMode(0o700)) catch {
+            io_mod.setDirPermissions(durable_home, zio, io_mod.permissionsFromMode(0o700)) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
         }
         const stat = try durable_home.stat(zio);
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        const durable_mode = stat.permissions.toMode() & 0o777;
-        if (mode == .writable and durable_mode != 0o700) {
+        if (mode == .writable and !io_mod.hasMode(stat.permissions, 0o700)) {
             return error.PrivateStatePermissionsUnsupported;
         }
-        if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
+        if (mode == .read_only and
+            durableModeWritableByGroupOrOther(io_mod.permissionsModeOrZero(stat.permissions)))
+        {
             return error.PrivateStatePermissionsUnsupported;
         }
 
@@ -728,16 +729,17 @@ pub const Store = struct {
         const stat = try file.stat(zio);
         try io_mod.verifyOpenedRegularFile(stat, open_mode);
         if (self.mode == .writable) {
-            file.setPermissions(zio, std.Io.File.Permissions.fromMode(0o600)) catch {
+            file.setPermissions(zio, io_mod.permissionsFromMode(0o600)) catch {
                 return error.PrivateStatePermissionsUnsupported;
             };
         }
         const verified_stat = if (self.mode == .writable) try file.stat(zio) else stat;
-        const primary_mode = verified_stat.permissions.toMode() & 0o777;
-        if (self.mode == .writable and primary_mode != 0o600) {
+        if (self.mode == .writable and !io_mod.hasMode(verified_stat.permissions, 0o600)) {
             return error.PrivateStatePermissionsUnsupported;
         }
-        if (self.mode == .read_only and durableModeWritableByGroupOrOther(primary_mode)) {
+        if (self.mode == .read_only and
+            durableModeWritableByGroupOrOther(io_mod.permissionsModeOrZero(verified_stat.permissions)))
+        {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (verified_stat.size > max_settings_bytes) return .oversized;
@@ -2040,7 +2042,7 @@ test "user patch snapshots and removes legacy workspace copies" {
     );
     defer recovery.close(io_mod.getIo());
     const recovery_stat = try recovery.stat(io_mod.getIo());
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), recovery_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(io_mod.Mode, 0o600), io_mod.permissionsModeOrZero(recovery_stat.permissions));
     const recovered = try io_mod.readFileToEnd(alloc, &recovery, max_settings_bytes + 1);
     defer alloc.free(recovered);
     try std.testing.expectEqualStrings(original, recovered);
@@ -2334,8 +2336,8 @@ test "user permission mutation preserves local rules" {
     defer alloc.free(workspace);
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"permission\":{{\"bash\":{{\"global *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
-        .{workspace},
+        "{{\"permission\":{{\"bash\":{{\"global *\":\"allow\"}}}},\"workspaces\":{{{f}:{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
+        .{std.json.fmt(workspace, .{})},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2375,8 +2377,8 @@ test "permission mutation validates scope paths and isolates remove and reset" {
     defer alloc.free(workspace);
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\",\"deny *\":\"deny\"}},\"read\":{{\"*\":\"allow\"}}}}}}}}}}\n",
-        .{workspace},
+        "{{\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{{f}:{{\"permission\":{{\"bash\":{{\"local *\":\"allow\",\"deny *\":\"deny\"}},\"read\":{{\"*\":\"allow\"}}}}}}}}}}\n",
+        .{std.json.fmt(workspace, .{})},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2552,8 +2554,8 @@ test "legacy interrupt keywords survive unrelated global and workspace patches" 
     defer alloc.free(workspace);
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"interrupt_keywords\":[\"status\"],\"future_global\":7,\"workspaces\":{{\"{s}\":{{\"interrupt_keywords\":[\"checkpoint\"],\"future_workspace\":9}}}}}}\n",
-        .{workspace},
+        "{{\"interrupt_keywords\":[\"status\"],\"future_global\":7,\"workspaces\":{{{f}:{{\"interrupt_keywords\":[\"checkpoint\"],\"future_workspace\":9}}}}}}\n",
+        .{std.json.fmt(workspace, .{})},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2645,8 +2647,8 @@ test "local sandbox patch preserves unknown statusline permission and workspace 
     defer alloc.free(workspace);
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"future_workspace\":9,\"statusLine\":{{\"future_status\":true}},\"permission\":{{\"future_tool\":{{\"future_pattern\":\"ask\"}}}}}}}}}}\n",
-        .{workspace},
+        "{{\"workspaces\":{{{f}:{{\"future_workspace\":9,\"statusLine\":{{\"future_status\":true}},\"permission\":{{\"future_tool\":{{\"future_pattern\":\"ask\"}}}}}}}}}}\n",
+        .{std.json.fmt(workspace, .{})},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2737,7 +2739,7 @@ test "missing user settings is created through private durable commit" {
     var outcome = try store.applyUserPatch(alloc, .{ .startup_scrollback = false });
     defer outcome.deinit(alloc);
     const stat = try store.primaryStatForTest();
-    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(io_mod.Mode, 0o600), io_mod.permissionsModeOrZero(stat.permissions));
 }
 
 test "invalid primary is not replaced by backup or mutation" {
@@ -2772,7 +2774,7 @@ test "invalid primary is not replaced by backup or mutation" {
             corrupt_count += 1;
             try std.testing.expect(parseSequence(entry.name) != null);
             const stat = try backups.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
-            try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+            try std.testing.expectEqual(@as(io_mod.Mode, 0o600), io_mod.permissionsModeOrZero(stat.permissions));
         }
     }
     try std.testing.expectEqual(@as(usize, 1), corrupt_count);
@@ -2855,7 +2857,7 @@ test "startup scrollback user patch removes matching legacy workspace value" {
     defer alloc.free(home);
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const fixture = try std.fmt.allocPrint(alloc, "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n", .{workspace});
+    const fixture = try std.fmt.allocPrint(alloc, "{{\"startup_scrollback\":true,\"workspaces\":{{{f}:{{\"startup_scrollback\":false}}}}}}\n", .{std.json.fmt(workspace, .{})});
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
     var store = try Store.initFromHome(alloc, home, .writable);
@@ -2880,8 +2882,8 @@ test "unrelated user patch preserves inert output level values" {
     defer alloc.free(workspace);
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"output_level\":{{\"legacy\":true}},\"workspaces\":{{\"{s}\":{{\"output_level\":[\"quiet\",7],\"future\":true}}}}}}\n",
-        .{workspace},
+        "{{\"output_level\":{{\"legacy\":true}},\"workspaces\":{{{f}:{{\"output_level\":[\"quiet\",7],\"future\":true}}}}}}\n",
+        .{std.json.fmt(workspace, .{})},
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2957,7 +2959,7 @@ test "second settings commit creates a sequenced private backup" {
         backup_count += 1;
         try std.testing.expect(parseSequence(entry.name) != null);
         const stat = try backups.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false });
-        try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+        try std.testing.expectEqual(@as(io_mod.Mode, 0o600), io_mod.permissionsModeOrZero(stat.permissions));
     }
     try std.testing.expectEqual(@as(usize, 1), backup_count);
 }
@@ -3025,7 +3027,7 @@ test "read only settings rejects group or world writable policy files" {
 
     var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
     defer root_dir.close(io_mod.getIo());
-    root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o777)) catch return error.SkipZigTest;
+    io_mod.setDirPermissions(root_dir, io_mod.getIo(), io_mod.permissionsFromMode(0o777)) catch return error.SkipZigTest;
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
@@ -3034,9 +3036,9 @@ test "read only settings rejects group or world writable policy files" {
         Store.initFromHome(alloc, home, .read_only),
     );
 
-    root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o755)) catch return error.SkipZigTest;
+    io_mod.setDirPermissions(root_dir, io_mod.getIo(), io_mod.permissionsFromMode(0o755)) catch return error.SkipZigTest;
     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
-    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o666)) catch {
+    file.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o666)) catch {
         file.close(io_mod.getIo());
         return error.SkipZigTest;
     };
@@ -3295,8 +3297,8 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(shared_link);
     const available_fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, shared_dot, shared_link },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f},{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(shared_dot, .{}), std.json.fmt(shared_link, .{}) },
     );
     defer alloc.free(available_fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", available_fixture);
@@ -3342,8 +3344,8 @@ test "workspace directory mutations use workspace access path identity" {
     defer alloc.free(missing_parent);
     const unavailable_fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, missing_dot, missing_parent },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f},{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(missing_dot, .{}), std.json.fmt(missing_parent, .{}) },
     );
     defer alloc.free(unavailable_fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", unavailable_fixture);
@@ -3398,8 +3400,8 @@ test "workspace directory removal uses observed sources and preserves unseen con
 
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, observed_source, unseen_source },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f},{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(observed_source, .{}), std.json.fmt(unseen_source, .{}) },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3459,8 +3461,8 @@ test "workspace directory removal stabilizes observed survivor identity" {
     };
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\",\"{s}\"]}}}}}}\n",
-        .{ primary, removed_source, survivor_source },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f},{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(removed_source, .{}), std.json.fmt(survivor_source, .{}) },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);
@@ -3671,8 +3673,8 @@ test "workspace directory existing add stabilizes a retargeted observed source" 
     }};
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
-        .{ primary, source },
+        "{{\"workspaces\":{{{f}:{{\"additional_directories\":[{f}]}}}}}}\n",
+        .{ std.json.fmt(primary, .{}), std.json.fmt(source, .{}) },
     );
     defer alloc.free(fixture);
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture);

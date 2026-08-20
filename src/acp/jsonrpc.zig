@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 
@@ -301,13 +302,18 @@ pub const Reader = struct {
 
     // Native ACP uses raw read(2) because Linux may pass socket-based stdin to
     // child processes. WASI has no std.posix surface, so use the injected std.Io
-    // backend and let the host's fd_read import suspend through JSPI.
+    // backend and let the host's fd_read import suspend through JSPI. Windows
+    // has no read(2), so it goes through std.Io as well.
     fn readStdin(_: ?*anyopaque, destination: []u8) usize {
         if (comptime host_target.is_wasm) {
             return std.Io.File.stdin().readStreaming(
                 io_mod.getIo(),
                 &.{destination},
             ) catch return 0;
+        }
+        if (comptime builtin.os.tag == .windows) {
+            var stdin_file = io_mod.stdinFile();
+            return stdin_file.readStreaming(io_mod.getIo(), &.{destination}) catch return 0;
         }
         return std.posix.read(std.posix.STDIN_FILENO, destination) catch return 0;
     }

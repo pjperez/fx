@@ -40,8 +40,9 @@ pub fn disableShadowVt(shell: anytype) void {
 
 pub fn writeFrameBytes(shell: anytype, metrics: *Metrics, bytes: []const u8) terminal_diff.FrameSinkWriteResult {
     var accepted_bytes: usize = 0;
+    var sink = io_mod.resolveStdFile(shell.stdout_file);
     while (accepted_bytes < bytes.len) {
-        const written = shell.stdout_file.writeStreaming(
+        const written = sink.writeStreaming(
             io_mod.getIo(),
             &.{},
             &.{bytes[accepted_bytes..]},
@@ -115,7 +116,7 @@ test "standalone presentation bell is written without changing the shadow grid" 
 
     try std.testing.expect(writeFrameBytes(&shell, &metrics, "\x07") == .complete);
     var bytes: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try file.readPositionalAll(io_mod.getIo(), &bytes, 0));
+    try std.testing.expectEqual(@as(usize, 1), try io_mod.readPositionalAll(file, &bytes, 0));
     try std.testing.expectEqual(@as(u8, 0x07), bytes[0]);
     try std.testing.expectEqual(@as(u21, ' '), shadow.cellAt(1, 1).?.codepoint);
 }

@@ -4873,7 +4873,7 @@ noinline fn readCoordinatorFrameBytes(alloc: std.mem.Allocator, file: std.Io.Fil
     const want: usize = @intCast(total - read_offset.*);
     const bytes = try alloc.alloc(u8, want);
     errdefer alloc.free(bytes);
-    const n = try file.readPositionalAll(io_mod.getIo(), bytes, read_offset.*);
+    const n = try io_mod.readPositionalAll(file, bytes, read_offset.*);
     try std.testing.expectEqual(want, n);
     read_offset.* += n;
     return bytes;

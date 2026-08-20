@@ -243,7 +243,7 @@ const SelectionScratch = struct {
 };
 
 fn gatherProjectContext(alloc: Allocator, input: InitialContextInput) context_contract.ProviderError!ProviderContext {
-    return gatherProjectContextWithHome(alloc, input, io_mod.getenv("HOME"));
+    return gatherProjectContextWithHome(alloc, input, io_mod.homeDir());
 }
 
 fn gatherProjectContextWithHome(
@@ -568,7 +568,7 @@ fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) 
         @min(limit.effectiveBytes() +| 3, context_limits.emergency_ceiling_bytes),
     );
     const content = try arena.alloc(u8, read_len);
-    const bytes_read = file.readPositionalAll(io_mod.getIo(), content, 0) catch
+    const bytes_read = io_mod.readPositionalAll(file, content, 0) catch
         return .{ .omitted = .unreadable };
     if (bytes_read != read_len) return .{ .omitted = .unreadable };
     const prefix_len = context_limits.lineSafePrefixLength(content, limit.effectiveBytes());
@@ -584,7 +584,7 @@ fn validateRuleUtf8(file: *std.Io.File, byte_count: usize) !bool {
 
     while (read_offset < byte_count) {
         const wanted = @min(chunk.len, byte_count - read_offset);
-        const bytes_read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], read_offset);
+        const bytes_read = try io_mod.readPositionalAll(file, chunk[0..wanted], read_offset);
         if (bytes_read != wanted) return error.UnexpectedEndOfFile;
         if (std.mem.trim(u8, chunk[0..bytes_read], trim_chars).len != 0) has_content = true;
         try validator.append(chunk[0..bytes_read]);
@@ -2049,7 +2049,7 @@ fn shellPath() ?[]const u8 {
 }
 
 fn homeDir() ?[]const u8 {
-    return io_mod.getenv("HOME") orelse io_mod.getenv("USERPROFILE");
+    return io_mod.homeDir() orelse io_mod.getenv("USERPROFILE");
 }
 
 fn todayUtcText(arena: Allocator) ![]const u8 {

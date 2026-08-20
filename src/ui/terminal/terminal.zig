@@ -1,5 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../../core/shared/types.zig");
+const io_mod = @import("../../core/shared/io.zig");
+
+const is_windows = builtin.os.tag == .windows;
+const windows_api = if (is_windows) @import("../../core/shared/windows_api.zig") else struct {};
 
 pub const interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[>1u\x1b[?2004h\x1b[?7l";
 const tmux_interactive_mode_enable_sequence = "\x1b[>4;2m\x1b[?2004h\x1b[?7l";
@@ -34,6 +39,15 @@ pub fn interactiveModeEnableSequence(tmux: ?[]const u8) []const u8 {
 }
 
 pub fn queryLayout(fd: std.posix.fd_t, footer_rows: u16) !types.Layout {
+    if (comptime is_windows) {
+        // Windows reports terminal geometry through the console screen buffer
+        // rather than a `TIOCGWINSZ` ioctl. The size query only answers for an
+        // output handle, so fall back to stdout when given an input handle.
+        const size = windows_api.windowSize(fd) orelse
+            windows_api.windowSize(io_mod.stdoutHandle()) orelse
+            return error.UnableToReadTerminalSize;
+        return layoutFromSize(size.rows, size.cols, footer_rows);
+    }
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
 
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);

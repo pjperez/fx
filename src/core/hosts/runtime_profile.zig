@@ -1,4 +1,5 @@
 const std = @import("std");
+const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
 
 pub const Profile = struct {
     cooperative_agent: bool,
@@ -38,7 +39,7 @@ pub const native = Profile{
     .file_index = true,
     .mcp = true,
     .subagents = true,
-    .auto_upgrade = true,
+    .auto_upgrade = upgrade_helpers.supported,
     .skills = true,
     .clipboard = true,
     .url_opening = true,

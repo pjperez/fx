@@ -54,7 +54,11 @@ const SystemSignalEffects = struct {
     }
 
     fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
-        return std.posix.kill(pid, signal);
+        // Signals are POSIX-only. Windows tears down a child tree through a job
+        // object instead, so this path is never taken there.
+        if (comptime builtin.os.tag == .windows) return error.ProcessNotFound else {
+            return std.posix.kill(pid, signal);
+        }
     }
 };
 
@@ -535,10 +539,12 @@ test "Linux proc helpers treat missing process data as vanished" {
 }
 
 test "process-group exclusion preserves the captured command grace" {
-    try std.testing.expect(shouldSignalProcess(41, null));
-    try std.testing.expect(!shouldSignalProcess(41, 41));
-    try std.testing.expect(shouldSignalProcess(42, 41));
-    try std.testing.expect(!shouldSignalProcess(null, 41));
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        try std.testing.expect(shouldSignalProcess(41, null));
+        try std.testing.expect(!shouldSignalProcess(41, 41));
+        try std.testing.expect(shouldSignalProcess(42, 41));
+        try std.testing.expect(!shouldSignalProcess(null, 41));
+    }
 }
 
 test "stale process identities cannot become traversal roots" {
@@ -557,12 +563,14 @@ test "stale process identities cannot become traversal roots" {
 }
 
 test "child admission binds the observed process to its expected parent" {
-    const snapshot = ProcessSnapshot{
-        .identity = .{ .linux_start_ticks = 42 },
-        .parent_pid = 17,
-    };
-    try std.testing.expect(snapshotBelongsToParent(snapshot, 17));
-    try std.testing.expect(!snapshotBelongsToParent(snapshot, 18));
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const snapshot = ProcessSnapshot{
+            .identity = .{ .linux_start_ticks = 42 },
+            .parent_pid = 17,
+        };
+        try std.testing.expect(snapshotBelongsToParent(snapshot, 17));
+        try std.testing.expect(!snapshotBelongsToParent(snapshot, 18));
+    }
 }
 
 test "macOS lineage identity matches only the same unique process" {
@@ -581,96 +589,100 @@ test "macOS lineage identity matches only the same unique process" {
 }
 
 test "checked signal delivery distinguishes vanished stale and failed targets" {
-    const FakeEffects = struct {
-        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
-            return switch (pid) {
-                11 => error.ProcessNotFound,
-                12 => error.ProcessIdentityUnavailable,
-                13 => .{
-                    .identity = .{ .linux_start_ticks = 113 },
-                    .parent_pid = 1,
-                },
-                else => .{
-                    .identity = .{ .linux_start_ticks = @intCast(pid) },
-                    .parent_pid = 1,
-                },
-            };
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const FakeEffects = struct {
+            fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+                return switch (pid) {
+                    11 => error.ProcessNotFound,
+                    12 => error.ProcessIdentityUnavailable,
+                    13 => .{
+                        .identity = .{ .linux_start_ticks = 113 },
+                        .parent_pid = 1,
+                    },
+                    else => .{
+                        .identity = .{ .linux_start_ticks = @intCast(pid) },
+                        .parent_pid = 1,
+                    },
+                };
+            }
+
+            fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+                return switch (pid) {
+                    14 => .vanished,
+                    15 => .unavailable,
+                    16 => .{ .found = 41 },
+                    else => .{ .found = pid + 100 },
+                };
+            }
+
+            fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+                return switch (pid) {
+                    17 => error.PermissionDenied,
+                    18 => error.ProcessNotFound,
+                    else => {},
+                };
+            }
+        };
+
+        var tracker = Tracker{ .alloc = std.testing.allocator };
+        defer tracker.deinit();
+        for (10..19) |pid| {
+            try tracker.processes.append(std.testing.allocator, .{
+                .pid = @intCast(pid),
+                .identity = .{ .linux_start_ticks = pid },
+            });
         }
 
-        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
-            return switch (pid) {
-                14 => .vanished,
-                15 => .unavailable,
-                16 => .{ .found = 41 },
-                else => .{ .found = pid + 100 },
-            };
-        }
-
-        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
-            return switch (pid) {
-                17 => error.PermissionDenied,
-                18 => error.ProcessNotFound,
-                else => {},
-            };
-        }
-    };
-
-    var tracker = Tracker{ .alloc = std.testing.allocator };
-    defer tracker.deinit();
-    for (10..19) |pid| {
-        try tracker.processes.append(std.testing.allocator, .{
-            .pid = @intCast(pid),
-            .identity = .{ .linux_start_ticks = pid },
-        });
+        const summary = tracker.signalProcessesWith(
+            std.posix.SIG.TERM,
+            41,
+            FakeEffects,
+        );
+        try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+        try std.testing.expect(summary.incomplete);
     }
-
-    const summary = tracker.signalProcessesWith(
-        std.posix.SIG.TERM,
-        41,
-        FakeEffects,
-    );
-    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
-    try std.testing.expect(summary.incomplete);
 }
 
 test "checked signal delivery keeps vanished stale and excluded targets complete" {
-    const FakeEffects = struct {
-        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
-            if (pid == 21) return error.ProcessNotFound;
-            return .{
-                .identity = .{ .linux_start_ticks = if (pid == 22) 122 else @as(u64, @intCast(pid)) },
-                .parent_pid = 1,
-            };
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const FakeEffects = struct {
+            fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+                if (pid == 21) return error.ProcessNotFound;
+                return .{
+                    .identity = .{ .linux_start_ticks = if (pid == 22) 122 else @as(u64, @intCast(pid)) },
+                    .parent_pid = 1,
+                };
+            }
+
+            fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+                return switch (pid) {
+                    23 => .vanished,
+                    else => .{ .found = 41 },
+                };
+            }
+
+            fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+                return;
+            }
+        };
+
+        var tracker = Tracker{ .alloc = std.testing.allocator };
+        defer tracker.deinit();
+        for (21..25) |pid| {
+            try tracker.processes.append(std.testing.allocator, .{
+                .pid = @intCast(pid),
+                .identity = .{ .linux_start_ticks = pid },
+            });
         }
 
-        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
-            return switch (pid) {
-                23 => .vanished,
-                else => .{ .found = 41 },
-            };
-        }
-
-        fn send(_: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
-            return;
-        }
-    };
-
-    var tracker = Tracker{ .alloc = std.testing.allocator };
-    defer tracker.deinit();
-    for (21..25) |pid| {
-        try tracker.processes.append(std.testing.allocator, .{
-            .pid = @intCast(pid),
-            .identity = .{ .linux_start_ticks = pid },
-        });
+        const summary = tracker.signalProcessesWith(
+            std.posix.SIG.TERM,
+            41,
+            FakeEffects,
+        );
+        try std.testing.expectEqual(@as(usize, 0), summary.delivered);
+        try std.testing.expect(!summary.incomplete);
     }
-
-    const summary = tracker.signalProcessesWith(
-        std.posix.SIG.TERM,
-        41,
-        FakeEffects,
-    );
-    try std.testing.expectEqual(@as(usize, 0), summary.delivered);
-    try std.testing.expect(!summary.incomplete);
 }
 
 fn captureSnapshot(alloc: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {

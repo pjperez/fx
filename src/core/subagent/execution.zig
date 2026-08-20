@@ -6597,90 +6597,92 @@ test "provider and admission failures release resources and persist typed work s
 }
 
 test "process-held session lock preserves queue until explicit exactly-once retry" {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "locked-child");
-    try env.installControl(alloc, "locked-child", .persistent, "model/locked", types.ReasoningEffort.literal("high"), &.{});
-    const lock_path = try std.fs.path.join(
-        alloc,
-        &.{ env.store.sessions_dir, "locked-child", "session.lock" },
-    );
-    defer alloc.free(lock_path);
-    const locker_script =
-        \\import fcntl, os, sys
-        \\lock_file = open(sys.argv[1], "a+b")
-        \\fcntl.flock(lock_file, fcntl.LOCK_EX)
-        \\os.write(1, b"R")
-        \\os.read(0, 1)
-    ;
-    const argv = [_][]const u8{
-        "/usr/bin/env",
-        "python3",
-        "-c",
-        locker_script,
-        lock_path,
-    };
-    var locker = try std.process.spawn(io_mod.getIo(), .{
-        .argv = &argv,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    var locker_reaped = false;
-    defer if (!locker_reaped) {
-        if (locker.stdin) |stdin_file| stdin_file.writeStreamingAll(
-            io_mod.getIo(),
-            "X",
-        ) catch {};
-        _ = locker.wait(io_mod.getIo()) catch {};
-    };
-    var ready: [1]u8 = undefined;
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        try std.posix.read(locker.stdout.?.handle, &ready),
-    );
-    try std.testing.expectEqual(@as(u8, 'R'), ready[0]);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, "locked-child");
+        try env.installControl(alloc, "locked-child", .persistent, "model/locked", types.ReasoningEffort.literal("high"), &.{});
+        const lock_path = try std.fs.path.join(
+            alloc,
+            &.{ env.store.sessions_dir, "locked-child", "session.lock" },
+        );
+        defer alloc.free(lock_path);
+        const locker_script =
+            \\import fcntl, os, sys
+            \\lock_file = open(sys.argv[1], "a+b")
+            \\fcntl.flock(lock_file, fcntl.LOCK_EX)
+            \\os.write(1, b"R")
+            \\os.read(0, 1)
+        ;
+        const argv = [_][]const u8{
+            "/usr/bin/env",
+            "python3",
+            "-c",
+            locker_script,
+            lock_path,
+        };
+        var locker = try std.process.spawn(io_mod.getIo(), .{
+            .argv = &argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        var locker_reaped = false;
+        defer if (!locker_reaped) {
+            if (locker.stdin) |stdin_file| stdin_file.writeStreamingAll(
+                io_mod.getIo(),
+                "X",
+            ) catch {};
+            _ = locker.wait(io_mod.getIo()) catch {};
+        };
+        var ready: [1]u8 = undefined;
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            try std.posix.read(locker.stdout.?.handle, &ready),
+        );
+        try std.testing.expectEqual(@as(u8, 'R'), ready[0]);
 
-    var manager = manager_mod.Manager{ .sessions = &env.store };
-    var send = try domain.validateCommand(alloc, .{ .message = .{ .send = .{
-        .id = "locked-child",
-        .content = "queued while externally owned",
-    } } });
-    defer send.deinit(alloc);
-    var admitted = try manager.execute(alloc, send, .{
-        .actor_id = "parent",
-        .operation_id = "locked-send",
-        .timestamp_ms = 2,
-    });
-    defer admitted.deinit(alloc);
+        var manager = manager_mod.Manager{ .sessions = &env.store };
+        var send = try domain.validateCommand(alloc, .{ .message = .{ .send = .{
+            .id = "locked-child",
+            .content = "queued while externally owned",
+        } } });
+        defer send.deinit(alloc);
+        var admitted = try manager.execute(alloc, send, .{
+            .actor_id = "parent",
+            .operation_id = "locked-send",
+            .timestamp_ms = 2,
+        });
+        defer admitted.deinit(alloc);
 
-    var fake = FakeExecution{ .alloc = alloc };
-    defer fake.deinit();
-    var owner = Owner{
-        .alloc = alloc,
-        .sessions = &env.store,
-        .manager = &manager,
-        .services = fake.services(),
-        .session_resume_options = .{ .log = .{ .session_lock_deadline_ms = 0 } },
-    };
-    defer owner.deinit();
-    try std.testing.expectEqual(StartResult.started, try owner.start("locked-child", false));
-    try std.testing.expectEqual(ChildResult.external_busy, try owner.join("locked-child"));
-    var queued = try env.loadControl(alloc, "locked-child");
-    try std.testing.expectEqual(domain.QueueStatus.pending, queued.queue[0].status);
-    queued.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), fake.entered.load(.seq_cst));
+        var fake = FakeExecution{ .alloc = alloc };
+        defer fake.deinit();
+        var owner = Owner{
+            .alloc = alloc,
+            .sessions = &env.store,
+            .manager = &manager,
+            .services = fake.services(),
+            .session_resume_options = .{ .log = .{ .session_lock_deadline_ms = 0 } },
+        };
+        defer owner.deinit();
+        try std.testing.expectEqual(StartResult.started, try owner.start("locked-child", false));
+        try std.testing.expectEqual(ChildResult.external_busy, try owner.join("locked-child"));
+        var queued = try env.loadControl(alloc, "locked-child");
+        try std.testing.expectEqual(domain.QueueStatus.pending, queued.queue[0].status);
+        queued.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), fake.entered.load(.seq_cst));
 
-    try locker.stdin.?.writeStreamingAll(io_mod.getIo(), "X");
-    _ = try locker.wait(io_mod.getIo());
-    locker_reaped = true;
-    try std.testing.expectEqual(StartResult.started, try owner.start("locked-child", false));
-    try std.testing.expectEqual(ChildResult.idle, try owner.join("locked-child"));
-    try std.testing.expectEqual(@as(usize, 1), fake.entered.load(.seq_cst));
-    var completed = try env.loadControl(alloc, "locked-child");
-    defer completed.deinit(alloc);
-    try std.testing.expectEqual(domain.QueueStatus.completed, completed.queue[0].status);
+        try locker.stdin.?.writeStreamingAll(io_mod.getIo(), "X");
+        _ = try locker.wait(io_mod.getIo());
+        locker_reaped = true;
+        try std.testing.expectEqual(StartResult.started, try owner.start("locked-child", false));
+        try std.testing.expectEqual(ChildResult.idle, try owner.join("locked-child"));
+        try std.testing.expectEqual(@as(usize, 1), fake.entered.load(.seq_cst));
+        var completed = try env.loadControl(alloc, "locked-child");
+        defer completed.deinit(alloc);
+        try std.testing.expectEqual(domain.QueueStatus.completed, completed.queue[0].status);
+    }
 }
 
 const ProcessBoundaryExecution = struct {
@@ -6809,81 +6811,83 @@ fn waitExternalExecutionProcess(pid: std.c.pid_t) !u8 {
 }
 
 test "recovery skips execution owned by another live process" {
-    if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "live-child");
-    try env.installControl(alloc, "live-child", .persistent, "model/live", types.ReasoningEffort.literal("high"), &.{"work"});
-    var ready_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeExecutionProcessFd(ready_pipe[0]);
-    defer closeExecutionProcessFd(ready_pipe[1]);
-    var release_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&release_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeExecutionProcessFd(release_pipe[0]);
-    defer closeExecutionProcessFd(release_pipe[1]);
-    const pid = std.c.fork();
-    if (pid < 0) return error.ProcessForkFailed;
-    if (pid == 0) std.c._exit(runExternalExecutionProcess(
-        env.home,
-        env.workspace,
-        ready_pipe[1],
-        release_pipe[0],
-    ));
-    var reaped = false;
-    defer if (!reaped) {
-        writeExecutionProcessPipe(release_pipe[1], &.{1}) catch {};
-        _ = waitExternalExecutionProcess(pid) catch {};
-    };
-    var ready: [1]u8 = undefined;
-    try readExecutionProcessPipe(ready_pipe[0], &ready);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, "live-child");
+        try env.installControl(alloc, "live-child", .persistent, "model/live", types.ReasoningEffort.literal("high"), &.{"work"});
+        var ready_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeExecutionProcessFd(ready_pipe[0]);
+        defer closeExecutionProcessFd(ready_pipe[1]);
+        var release_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&release_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeExecutionProcessFd(release_pipe[0]);
+        defer closeExecutionProcessFd(release_pipe[1]);
+        const pid = std.c.fork();
+        if (pid < 0) return error.ProcessForkFailed;
+        if (pid == 0) std.c._exit(runExternalExecutionProcess(
+            env.home,
+            env.workspace,
+            ready_pipe[1],
+            release_pipe[0],
+        ));
+        var reaped = false;
+        defer if (!reaped) {
+            writeExecutionProcessPipe(release_pipe[1], &.{1}) catch {};
+            _ = waitExternalExecutionProcess(pid) catch {};
+        };
+        var ready: [1]u8 = undefined;
+        try readExecutionProcessPipe(ready_pipe[0], &ready);
 
-    var fake = FakeExecution{ .alloc = alloc };
-    defer fake.deinit();
-    var manager = manager_mod.Manager{ .sessions = &env.store };
-    var recovery = Owner{
-        .alloc = alloc,
-        .sessions = &env.store,
-        .manager = &manager,
-        .services = fake.services(),
-        .session_resume_options = .{ .log = .{ .session_lock_deadline_ms = 0 } },
-    };
-    defer recovery.deinit();
-    const report = try recovery.recover(8);
-    try std.testing.expectEqual(@as(usize, 1), report.sessions_external_busy);
-    try std.testing.expectEqual(@as(usize, 0), report.sessions_changed);
-    try std.testing.expect(recovery.lastResult("live-child") == null);
-    try std.testing.expect(recovery.externalBusy("live-child"));
-    const repeated = try recovery.recover(9);
-    try std.testing.expectEqual(@as(usize, 1), repeated.sessions_external_busy);
-    try std.testing.expect(recovery.externalBusy("live-child"));
-    var record = try env.loadControl(alloc, "live-child");
-    try std.testing.expectEqual(domain.QueueStatus.running, record.queue[0].status);
-    record.deinit(alloc);
+        var fake = FakeExecution{ .alloc = alloc };
+        defer fake.deinit();
+        var manager = manager_mod.Manager{ .sessions = &env.store };
+        var recovery = Owner{
+            .alloc = alloc,
+            .sessions = &env.store,
+            .manager = &manager,
+            .services = fake.services(),
+            .session_resume_options = .{ .log = .{ .session_lock_deadline_ms = 0 } },
+        };
+        defer recovery.deinit();
+        const report = try recovery.recover(8);
+        try std.testing.expectEqual(@as(usize, 1), report.sessions_external_busy);
+        try std.testing.expectEqual(@as(usize, 0), report.sessions_changed);
+        try std.testing.expect(recovery.lastResult("live-child") == null);
+        try std.testing.expect(recovery.externalBusy("live-child"));
+        const repeated = try recovery.recover(9);
+        try std.testing.expectEqual(@as(usize, 1), repeated.sessions_external_busy);
+        try std.testing.expect(recovery.externalBusy("live-child"));
+        var record = try env.loadControl(alloc, "live-child");
+        try std.testing.expectEqual(domain.QueueStatus.running, record.queue[0].status);
+        record.deinit(alloc);
 
-    try writeExecutionProcessPipe(release_pipe[1], &.{1});
-    try std.testing.expectEqual(@as(u8, 0), try waitExternalExecutionProcess(pid));
-    reaped = true;
-    const settled = try recovery.recover(10);
-    try std.testing.expect(settled.fullyReconciled());
-    try std.testing.expect(!recovery.externalBusy("live-child"));
-    var completed = try env.loadControl(alloc, "live-child");
-    defer completed.deinit(alloc);
-    try std.testing.expectEqual(domain.State.idle, completed.state);
-    try std.testing.expectEqual(domain.QueueStatus.completed, completed.queue[0].status);
-    var loaded = try env.store.resumeForWrite(alloc, "live-child");
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
-    try std.testing.expectEqualStrings(
-        "work",
-        loaded.state.history[0].assistant.user.work_id.?,
-    );
-    try std.testing.expect(
-        loaded.state.history[0].assistant.user.work_id.?.ptr !=
-            loaded.state.last_subagent_work_id.?.ptr,
-    );
-    try std.testing.expectEqualStrings("work", loaded.state.last_subagent_work_id.?);
+        try writeExecutionProcessPipe(release_pipe[1], &.{1});
+        try std.testing.expectEqual(@as(u8, 0), try waitExternalExecutionProcess(pid));
+        reaped = true;
+        const settled = try recovery.recover(10);
+        try std.testing.expect(settled.fullyReconciled());
+        try std.testing.expect(!recovery.externalBusy("live-child"));
+        var completed = try env.loadControl(alloc, "live-child");
+        defer completed.deinit(alloc);
+        try std.testing.expectEqual(domain.State.idle, completed.state);
+        try std.testing.expectEqual(domain.QueueStatus.completed, completed.queue[0].status);
+        var loaded = try env.store.resumeForWrite(alloc, "live-child");
+        defer loaded.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), loaded.state.history.len);
+        try std.testing.expectEqualStrings(
+            "work",
+            loaded.state.history[0].assistant.user.work_id.?,
+        );
+        try std.testing.expect(
+            loaded.state.history[0].assistant.user.work_id.?.ptr !=
+                loaded.state.last_subagent_work_id.?.ptr,
+        );
+        try std.testing.expectEqualStrings("work", loaded.state.last_subagent_work_id.?);
+    }
 }
 
 test "recovery does not classify a locally owned child as externally busy" {
@@ -6932,60 +6936,62 @@ test "recovery does not classify a locally owned child as externally busy" {
 }
 
 test "shutdown joins while control locking and control writes are unavailable" {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "shutdown-unavailable");
-    try env.installControl(alloc, "shutdown-unavailable", .persistent, "model/live", types.ReasoningEffort.literal("high"), &.{"work"});
-    var fake = FakeExecution{ .alloc = alloc, .barrier = true };
-    defer fake.deinit();
-    var manager = manager_mod.Manager{ .sessions = &env.store };
-    var owner = Owner{ .alloc = alloc, .sessions = &env.store, .manager = &manager, .services = fake.services() };
-    try std.testing.expectEqual(StartResult.started, try owner.start("shutdown-unavailable", false));
-    try waitForEntries(&fake, 1);
-    const lock_path = try std.fs.path.join(alloc, &.{
-        env.store.sessions_dir,
-        "shutdown-unavailable",
-        "subagent",
-        "subagent-control.lock",
-    });
-    defer alloc.free(lock_path);
-    const script =
-        \\import fcntl, os, sys
-        \\lock_file = open(sys.argv[1], "a+b")
-        \\fcntl.flock(lock_file, fcntl.LOCK_EX)
-        \\os.write(1, b"R")
-        \\os.read(0, 1)
-    ;
-    const argv = [_][]const u8{ "/usr/bin/env", "python3", "-c", script, lock_path };
-    var locker = try std.process.spawn(io_mod.getIo(), .{
-        .argv = &argv,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    var locker_reaped = false;
-    defer if (!locker_reaped) {
-        if (locker.stdin) |stdin_file| stdin_file.writeStreamingAll(io_mod.getIo(), "X") catch {};
-        _ = locker.wait(io_mod.getIo()) catch {};
-    };
-    var ready: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(locker.stdout.?.handle, &ready));
-    var write_failure = FailNthControlSync{ .fail_at = 1 };
-    owner.child_store_options = .{ .replace_ops = .{
-        .ctx = &write_failure,
-        .sync_file = FailNthControlSync.syncFile,
-    } };
-    owner.deinit();
-    try std.testing.expectEqual(@as(usize, 0), write_failure.calls);
-    try locker.stdin.?.writeStreamingAll(io_mod.getIo(), "X");
-    _ = try locker.wait(io_mod.getIo());
-    locker_reaped = true;
-    var resumed = try env.store.resumeForWrite(alloc, "shutdown-unavailable");
-    resumed.deinit(alloc);
-    var record = try env.loadControl(alloc, "shutdown-unavailable");
-    defer record.deinit(alloc);
-    try std.testing.expectEqual(domain.QueueStatus.running, record.queue[0].status);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, "shutdown-unavailable");
+        try env.installControl(alloc, "shutdown-unavailable", .persistent, "model/live", types.ReasoningEffort.literal("high"), &.{"work"});
+        var fake = FakeExecution{ .alloc = alloc, .barrier = true };
+        defer fake.deinit();
+        var manager = manager_mod.Manager{ .sessions = &env.store };
+        var owner = Owner{ .alloc = alloc, .sessions = &env.store, .manager = &manager, .services = fake.services() };
+        try std.testing.expectEqual(StartResult.started, try owner.start("shutdown-unavailable", false));
+        try waitForEntries(&fake, 1);
+        const lock_path = try std.fs.path.join(alloc, &.{
+            env.store.sessions_dir,
+            "shutdown-unavailable",
+            "subagent",
+            "subagent-control.lock",
+        });
+        defer alloc.free(lock_path);
+        const script =
+            \\import fcntl, os, sys
+            \\lock_file = open(sys.argv[1], "a+b")
+            \\fcntl.flock(lock_file, fcntl.LOCK_EX)
+            \\os.write(1, b"R")
+            \\os.read(0, 1)
+        ;
+        const argv = [_][]const u8{ "/usr/bin/env", "python3", "-c", script, lock_path };
+        var locker = try std.process.spawn(io_mod.getIo(), .{
+            .argv = &argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        var locker_reaped = false;
+        defer if (!locker_reaped) {
+            if (locker.stdin) |stdin_file| stdin_file.writeStreamingAll(io_mod.getIo(), "X") catch {};
+            _ = locker.wait(io_mod.getIo()) catch {};
+        };
+        var ready: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try std.posix.read(locker.stdout.?.handle, &ready));
+        var write_failure = FailNthControlSync{ .fail_at = 1 };
+        owner.child_store_options = .{ .replace_ops = .{
+            .ctx = &write_failure,
+            .sync_file = FailNthControlSync.syncFile,
+        } };
+        owner.deinit();
+        try std.testing.expectEqual(@as(usize, 0), write_failure.calls);
+        try locker.stdin.?.writeStreamingAll(io_mod.getIo(), "X");
+        _ = try locker.wait(io_mod.getIo());
+        locker_reaped = true;
+        var resumed = try env.store.resumeForWrite(alloc, "shutdown-unavailable");
+        resumed.deinit(alloc);
+        var record = try env.loadControl(alloc, "shutdown-unavailable");
+        defer record.deinit(alloc);
+        try std.testing.expectEqual(domain.QueueStatus.running, record.queue[0].status);
+    }
 }
 
 test "shutdown joins without consulting an injected failing control writer" {

@@ -735,7 +735,7 @@ fn validateStagedSource(
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var reader_buffer: [8192]u8 = undefined;
-    var reader = stage.reader(io_mod.getIo(), &reader_buffer);
+    var reader = io_mod.fileReader(stage, &reader_buffer);
     reader.seekTo(0) catch return .io_failure;
     var chunk: [8192]u8 = undefined;
     while (true) {
@@ -1001,14 +1001,14 @@ fn validatePreimage(
             const expected_identity = prepared.policy_targets.items[0].expected_identity orelse
                 break :blk .stale;
             if (!identityEql(actual_identity, expected_identity)) break :blk .stale;
-            if (stat.permissions.toMode() & 0o222 == 0) break :blk .io_failure;
+            if (!io_mod.isPermissionWritable(stat.permissions)) break :blk .io_failure;
             if (expected_permissions) |permissions| {
-                if (stat.permissions.toMode() != permissions.toMode()) break :blk .stale;
+                if (!io_mod.permissionsEql(stat.permissions, permissions)) break :blk .stale;
             }
 
             var hasher = std.crypto.hash.sha2.Sha256.init(.{});
             var read_buffer: [8192]u8 = undefined;
-            var reader = file.reader(zio, &read_buffer);
+            var reader = io_mod.fileReader(file, &read_buffer);
             var chunk: [8192]u8 = undefined;
             while (true) {
                 const bytes_read = reader.interface.readSliceShort(&chunk) catch
@@ -1399,7 +1399,7 @@ fn verifyAndReadPreimage(
     }
 
     var read_buf: [8192]u8 = undefined;
-    var reader = file.reader(zio, &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     const content = reader.interface.allocRemaining(
         alloc,
         .limited(max_content_bytes + 1),
@@ -3258,7 +3258,7 @@ test "apply preserves the existing destination mode" {
         defer file.close(std.testing.io);
         try file.setPermissions(
             std.testing.io,
-            std.Io.File.Permissions.fromMode(0o640),
+            io_mod.permissionsFromMode(0o640),
         );
     }
     var call_arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3290,8 +3290,8 @@ test "apply preserves the existing destination mode" {
         .{ .follow_symlinks = false },
     );
     try std.testing.expectEqual(
-        @as(std.posix.mode_t, 0o640),
-        stat.permissions.toMode() & 0o777,
+        @as(io_mod.Mode, 0o640),
+        io_mod.permissionsModeOrZero(stat.permissions),
     );
 }
 

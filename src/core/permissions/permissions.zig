@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const command_environment = @import("../execution/command_environment.zig");
 
@@ -1672,33 +1673,90 @@ fn permissionPatternMatchesTool(pattern: []const u8, permission: []const u8, too
 
 fn permissionPatternMatchesTarget(pattern: []const u8, candidate: []const u8) bool {
     if (directoryTreePatternMatches(pattern, candidate)) return true;
-    return wildcardMatch(pattern, candidate);
+    return pathWildcardMatch(pattern, candidate);
+}
+
+/// Permission patterns name paths with `/`, which is what fx documents and what
+/// keeps a checked-in rule set meaningful on every platform. Windows resolves a
+/// target to a `\` separated path, so a byte-exact comparison would never match
+/// one: a configured deny would quietly stop applying and an allow would turn
+/// into a prompt. Separators are therefore equivalent while matching a pattern
+/// against a path, in the same way the platform's own path APIs accept either.
+const path_separators_equivalent = builtin.os.tag == .windows;
+
+fn isPathSeparatorByte(byte: u8) bool {
+    return byte == '/' or byte == '\\';
 }
 
 fn directoryTreePatternMatches(pattern: []const u8, candidate: []const u8) bool {
-    if (!std.mem.endsWith(u8, pattern, "/**")) return false;
-    if (std.mem.eql(u8, pattern, "/**")) return std.mem.startsWith(u8, candidate, "/");
+    const suffix = directoryTreePatternSuffix(pattern) orelse return false;
+    if (pattern.len == suffix.len) return candidate.len > 0 and isSeparator(candidate[0]);
 
-    const dir = pattern[0 .. pattern.len - "/**".len];
-    if (std.mem.eql(u8, candidate, dir)) return true;
+    const dir = pattern[0 .. pattern.len - suffix.len];
+    if (pathEql(candidate, dir)) return true;
     return candidate.len > dir.len and
-        std.mem.startsWith(u8, candidate, dir) and
-        candidate[dir.len] == '/';
+        pathEql(candidate[0..dir.len], dir) and
+        isSeparator(candidate[dir.len]);
+}
+
+/// Returns the `/**` tail of a directory tree pattern, accepting either
+/// separator where they are equivalent.
+fn directoryTreePatternSuffix(pattern: []const u8) ?[]const u8 {
+    if (std.mem.endsWith(u8, pattern, "/**")) return pattern[pattern.len - "/**".len ..];
+    if (comptime path_separators_equivalent) {
+        if (std.mem.endsWith(u8, pattern, "\\**")) return pattern[pattern.len - "\\**".len ..];
+    }
+    return null;
+}
+
+fn isSeparator(byte: u8) bool {
+    if (comptime !path_separators_equivalent) return byte == '/';
+    return isPathSeparatorByte(byte);
+}
+
+fn pathEql(a: []const u8, b: []const u8) bool {
+    if (comptime !path_separators_equivalent) return std.mem.eql(u8, a, b);
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!pathByteEql(left, right)) return false;
+    }
+    return true;
+}
+
+fn pathByteEql(a: u8, b: u8) bool {
+    if (a == b) return true;
+    if (comptime !path_separators_equivalent) return false;
+    return isPathSeparatorByte(a) and isPathSeparatorByte(b);
 }
 
 fn wildcardMatch(pattern: []const u8, candidate: []const u8) bool {
+    return wildcardMatchBytes(pattern, candidate, false);
+}
+
+fn pathWildcardMatch(pattern: []const u8, candidate: []const u8) bool {
+    return wildcardMatchBytes(pattern, candidate, path_separators_equivalent);
+}
+
+fn wildcardMatchBytes(
+    pattern: []const u8,
+    candidate: []const u8,
+    comptime separators_equivalent: bool,
+) bool {
     if (pattern.len == 0) return candidate.len == 0;
     if (pattern[0] == '*') {
-        if (wildcardMatch(pattern[1..], candidate)) return true;
+        if (wildcardMatchBytes(pattern[1..], candidate, separators_equivalent)) return true;
         if (candidate.len == 0) return false;
-        return wildcardMatch(pattern, candidate[1..]);
+        return wildcardMatchBytes(pattern, candidate[1..], separators_equivalent);
     }
     if (pattern[0] == '?') {
         if (candidate.len == 0) return false;
-        return wildcardMatch(pattern[1..], candidate[1..]);
+        return wildcardMatchBytes(pattern[1..], candidate[1..], separators_equivalent);
     }
-    if (candidate.len == 0 or pattern[0] != candidate[0]) return false;
-    return wildcardMatch(pattern[1..], candidate[1..]);
+    if (candidate.len == 0) return false;
+    if (separators_equivalent) {
+        if (!pathByteEql(pattern[0], candidate[0])) return false;
+    } else if (pattern[0] != candidate[0]) return false;
+    return wildcardMatchBytes(pattern[1..], candidate[1..], separators_equivalent);
 }
 
 fn isGlobalTargetPattern(pattern: []const u8) bool {
@@ -2683,6 +2741,34 @@ test "configured command rules match explicit environments by command" {
             .none,
         ),
     );
+}
+
+test "a configured path rule applies whichever separator the platform resolved" {
+    // A rule set is written once with `/` and has to keep meaning the same thing
+    // where paths come back separated by `\`, otherwise a deny silently stops
+    // applying and the target is decided by whatever rule matches next.
+    try std.testing.expect(permissionPatternMatchesTarget("src/app.zig", "src/app.zig"));
+    try std.testing.expect(permissionPatternMatchesTarget("src/**", "src/lib/app.zig"));
+    try std.testing.expect(permissionPatternMatchesTarget("src/*.zig", "src/app.zig"));
+
+    const separated = "src\\app.zig";
+    const nested = "src\\lib\\app.zig";
+    if (comptime path_separators_equivalent) {
+        try std.testing.expect(permissionPatternMatchesTarget("src/app.zig", separated));
+        try std.testing.expect(permissionPatternMatchesTarget("src\\app.zig", "src/app.zig"));
+        try std.testing.expect(permissionPatternMatchesTarget("src/**", nested));
+        try std.testing.expect(permissionPatternMatchesTarget("src\\**", "src/lib/app.zig"));
+        try std.testing.expect(permissionPatternMatchesTarget("src/*.zig", separated));
+    } else {
+        // A backslash is an ordinary filename byte on POSIX and must not be
+        // confused with a separator.
+        try std.testing.expect(!permissionPatternMatchesTarget("src/app.zig", separated));
+        try std.testing.expect(!permissionPatternMatchesTarget("src/**", nested));
+    }
+
+    // Neither platform may widen a pattern past the directory it names.
+    try std.testing.expect(!permissionPatternMatchesTarget("src/**", "src-other/app.zig"));
+    try std.testing.expect(!permissionPatternMatchesTarget("src/app.zig", "src/app.zig.bak"));
 }
 
 test "directory tree permission patterns match directory and descendants only" {

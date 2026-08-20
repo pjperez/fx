@@ -195,6 +195,7 @@ pub const AutoUpgrade = struct {
         ChecksumFailed,
         ExtractionFailed,
         SelfExeNotFound,
+        Unsupported,
         InstallFailed,
         Cancelled,
     };
@@ -205,6 +206,7 @@ pub const AutoUpgrade = struct {
         target: update_target.Target,
         cdn_base: []const u8,
     ) InstallError!void {
+        if (comptime !helpers.supported) return error.Unsupported;
         var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
         defer client.deinit();
 

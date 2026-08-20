@@ -20,6 +20,37 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 
 const Allocator = std.mem.Allocator;
+
+const is_windows = builtin.os.tag == .windows;
+const windows_tree = if (is_windows) @import("../shared/windows_process_tree.zig") else struct {};
+
+/// Windows has no process groups, so a spawned child and its descendants are
+/// held together by a job object instead. Tracking must happen as soon as the
+/// child exists, before it can spawn children of its own.
+fn trackProcessTree(child: *std.process.Child) void {
+    if (comptime !is_windows) return;
+    const handle = child.id orelse return;
+    if (!windows_tree.track(handle)) {
+        debug_trace.logf("core", "command process tree tracking unavailable", .{});
+    }
+}
+
+fn releaseProcessTree(child: *std.process.Child) void {
+    if (comptime !is_windows) return;
+    const handle = child.id orelse return;
+    windows_tree.release(handle);
+}
+
+/// Terminates the child and everything below it. Falls back to a single-process
+/// kill when the tree could not be tracked.
+fn killProcessTree(child: *std.process.Child) void {
+    if (comptime is_windows) {
+        if (child.id) |handle| {
+            if (windows_tree.terminate(handle, 1)) return;
+        }
+    }
+    child.kill(io_mod.getIo());
+}
 pub const CommandOutputStream = command_contract.CommandOutputStream;
 pub const CommandOutputCallback = command_contract.CommandOutputCallback;
 pub const CommandExecutionResult = command_contract.RunCommandResult;
@@ -284,68 +315,71 @@ fn foregroundSessionTerminationRequested() bool {
 fn waitForForegroundTarget(
     target: *std.process.Child,
 ) !std.process.Child.Term {
-    const target_pid = target.id orelse return error.ForegroundTargetMissing;
-    var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
-    defer descendants.deinit();
-    if (comptime builtin.os.tag == .macos) {
-        try descendants.refresh(target_pid);
-        try std.posix.kill(target_pid, std.posix.SIG.CONT);
-    }
-    var termination_started_ms: ?i64 = null;
-    var forced = false;
-
-    while (true) {
-        try refreshForegroundTargetTree(&descendants, target_pid);
-        const now_ms = io_mod.milliTimestamp();
-        if (foregroundSessionTerminationRequested()) {
-            if (termination_started_ms == null) {
-                beginForegroundTargetTermination(
-                    &descendants,
-                    now_ms,
-                    &termination_started_ms,
-                );
-            } else if (!forced and
-                now_ms - termination_started_ms.? >= foreground_target_termination_grace_ms)
-            {
-                forced = true;
-                forceKillForegroundTargetDescendants(&descendants);
-            }
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ForegroundTargetMissing else {
+        const target_pid = target.id orelse return error.ForegroundTargetMissing;
+        var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
+        defer descendants.deinit();
+        if (comptime builtin.os.tag == .macos) {
+            try descendants.refresh(target_pid);
+            try std.posix.kill(target_pid, std.posix.SIG.CONT);
         }
+        var termination_started_ms: ?i64 = null;
+        var forced = false;
 
-        if (try pollProcessLeader(target)) |term| {
+        while (true) {
             try refreshForegroundTargetTree(&descendants, target_pid);
-            if (termination_started_ms == null and
-                foregroundSessionTerminationRequested())
-            {
-                beginForegroundTargetTermination(
-                    &descendants,
-                    io_mod.milliTimestamp(),
-                    &termination_started_ms,
-                );
+            const now_ms = io_mod.milliTimestamp();
+            if (foregroundSessionTerminationRequested()) {
+                if (termination_started_ms == null) {
+                    beginForegroundTargetTermination(
+                        &descendants,
+                        now_ms,
+                        &termination_started_ms,
+                    );
+                } else if (!forced and
+                    now_ms - termination_started_ms.? >= foreground_target_termination_grace_ms)
+                {
+                    forced = true;
+                    forceKillForegroundTargetDescendants(&descendants);
+                }
             }
-            if (termination_started_ms) |started_ms| {
-                try waitForForegroundTargetDescendants(
+
+            if (try pollProcessLeader(target)) |term| {
+                try refreshForegroundTargetTree(&descendants, target_pid);
+                if (termination_started_ms == null and
+                    foregroundSessionTerminationRequested())
+                {
+                    beginForegroundTargetTermination(
+                        &descendants,
+                        io_mod.milliTimestamp(),
+                        &termination_started_ms,
+                    );
+                }
+                if (termination_started_ms) |started_ms| {
+                    try waitForForegroundTargetDescendants(
+                        &descendants,
+                        target_pid,
+                        started_ms,
+                        &forced,
+                    );
+                    return term;
+                }
+                const count = try cleanupCompletedForegroundTarget(
                     &descendants,
                     target_pid,
-                    started_ms,
-                    &forced,
                 );
+                if (count > 0) {
+                    debug_trace.logf(
+                        "core",
+                        "captured command target completed; tracked descendants terminated count={d}",
+                        .{count},
+                    );
+                }
                 return term;
             }
-            const count = try cleanupCompletedForegroundTarget(
-                &descendants,
-                target_pid,
-            );
-            if (count > 0) {
-                debug_trace.logf(
-                    "core",
-                    "captured command target completed; tracked descendants terminated count={d}",
-                    .{count},
-                );
-            }
-            return term;
+            io_mod.sleep(std.time.ns_per_ms);
         }
-        io_mod.sleep(std.time.ns_per_ms);
     }
 }
 
@@ -768,7 +802,7 @@ fn buildMacOSPermissiveProfile(arena: Allocator, workspace_root: []const u8, opt
 }
 
 fn buildMacOSPermissiveProfileForScope(arena: Allocator, scope: workspace_access.AccessScope, options: MacOSProfileOptions) ![]const u8 {
-    const home = io_mod.getenv("HOME") orelse return buildMacOSProfileForScope(arena, scope, options);
+    const home = io_mod.homeDir() orelse return buildMacOSProfileForScope(arena, scope, options);
 
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
@@ -1467,6 +1501,7 @@ fn executeProcessWithInput(
         .cwd = .{ .path = cwd },
         .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
+    trackProcessTree(&child);
     if (child.stdin) |input| {
         input.close(io_mod.getIo());
         child.stdin = null;
@@ -1501,6 +1536,7 @@ fn executeProcessWithInput(
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
+    releaseProcessTree(&child);
 
     return finishCollectedProcess(&output, term, duration_ms, source);
 }
@@ -1625,6 +1661,7 @@ fn executeProcessWithDetachedSession(
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
+    releaseProcessTree(&child);
 
     if (foregroundSessionReplacementError(term, launch_failure_probe)) |launch_err| return launch_err;
     if (script_write_error) |write_err| return write_err;
@@ -1742,6 +1779,7 @@ fn executeProcessWithScriptUnisolated(
         .cwd = .{ .path = cwd },
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
+    trackProcessTree(&child);
 
     var output = OutputCollector.init(scratch, cfg);
     defer output.deinit();
@@ -1776,6 +1814,7 @@ fn executeProcessWithScriptUnisolated(
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
     child_needs_cleanup = false;
+    releaseProcessTree(&child);
 
     return finishCollectedProcess(&output, term, duration_ms, source);
 }
@@ -1941,7 +1980,7 @@ fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
 }
 
 fn currentProcessId() u64 {
-    return @intCast(std.c.getpid());
+    return io_mod.currentProcessId();
 }
 
 fn elapsedMs(started_ms: i64, finished_ms: i64) u64 {
@@ -2696,8 +2735,10 @@ fn signalChild(
     process_group_id: ?std.posix.pid_t,
     force: bool,
 ) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        child.kill(io_mod.getIo());
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Neither target has POSIX signals, so termination is unconditional and
+        // the graceful pass is indistinguishable from the forced one.
+        killProcessTree(child);
         return;
     }
 
@@ -2707,6 +2748,9 @@ fn signalChild(
 }
 
 fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return;
+    }
     std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
         error.ProcessNotFound => {},
         else => return err,
@@ -2714,6 +2758,9 @@ fn signalProcessGroup(pid: std.posix.pid_t, force: bool) !void {
 }
 
 fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        return;
+    }
     signalProcessGroup(pid, true) catch |err| {
         debug_trace.logf(
             "core",
@@ -2738,8 +2785,9 @@ fn cleanupChild(child: *std.process.Child) void {
         closeChildPipes(child);
         return;
     }
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        child.kill(io_mod.getIo());
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        killProcessTree(child);
+        releaseProcessTree(child);
         return;
     }
     const pid = child.id orelse return;
@@ -3149,7 +3197,7 @@ test "permissive profile includes home cache package paths" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const profile = try buildMacOSPermissiveProfile(arena_state.allocator(), "/tmp/workspace", .{});
-    const home = io_mod.getenv("HOME") orelse return;
+    const home = io_mod.homeDir() orelse return;
 
     const npm = try std.fmt.allocPrint(arena_state.allocator(), "{s}/.npm", .{home});
     const cargo = try std.fmt.allocPrint(arena_state.allocator(), "{s}/.cargo", .{home});
@@ -3165,7 +3213,7 @@ test "permissive macos localhost listen profile does not broaden home writes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const profile = try buildMacOSPermissiveProfile(arena_state.allocator(), "/tmp/workspace", .{ .allow_localhost_listen = true });
-    const home = io_mod.getenv("HOME") orelse return;
+    const home = io_mod.homeDir() orelse return;
 
     try std.testing.expect(std.mem.find(u8, profile, "(allow network-bind (local ip \"localhost:*\"))") != null);
     try std.testing.expect(std.mem.find(u8, profile, "(allow network-inbound (local ip \"localhost:*\"))") != null);
@@ -3288,8 +3336,11 @@ fn spawnUnreadyForegroundSessionChildForTest(argv: []const []const u8) !std.proc
 }
 
 fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !void {
-    try std.testing.expect(child.id == null);
-    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) {} else {
+        try std.testing.expect(child.id == null);
+        try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    }
 }
 
 test "captured foreground command runs beneath a detached session supervisor" {
@@ -3668,7 +3719,7 @@ test "managed command artifact confirms an indeterminate rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -3750,7 +3801,7 @@ test "managed command artifact rejects an unconfirmed rename target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -4057,7 +4108,7 @@ test "cancellation preserves the termination grace in an invoked script" {
         );
         try script.setPermissions(
             io_mod.getIo(),
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromMode(0o700),
         );
     }
 
@@ -4137,7 +4188,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(
         alloc,
@@ -4338,9 +4389,9 @@ test "artifact write failure after cancellation remains a bare error" {
         .output_file = "/dev/null",
         .stdout_file = "/dev/null",
         .stderr_file = "/dev/null",
-        .output = .{ .external = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{}) },
-        .stdout = .{ .external = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{}) },
-        .stderr = .{ .external = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), "/dev/null", .{}) },
+        .output = .{ .external = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), io_mod.null_device, .{}) },
+        .stdout = .{ .external = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), io_mod.null_device, .{}) },
+        .stderr = .{ .external = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), io_mod.null_device, .{}) },
     };
 
     const Watcher = struct {
@@ -4448,17 +4499,20 @@ test "timeout terminates foreground process group descendants" {
 }
 
 fn expectProcessGone(pid: std.posix.pid_t) !void {
-    const started_ms = io_mod.milliTimestamp();
-    while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => return err,
-        };
-        if (io_mod.milliTimestamp() - started_ms > 1000) {
-            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-            return error.TestUnexpectedResult;
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) {} else {
+        const started_ms = io_mod.milliTimestamp();
+        while (true) {
+            std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+                error.ProcessNotFound => return,
+                else => return err,
+            };
+            if (io_mod.milliTimestamp() - started_ms > 1000) {
+                std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+                return error.TestUnexpectedResult;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
         }
-        io_mod.sleep(10 * std.time.ns_per_ms);
     }
 }
 
@@ -4892,7 +4946,7 @@ test "just_bash post-spawn cancellation does not parse or execute fallback" {
         var fake = try tmp.dir.createFile(io_mod.getIo(), "workspace/fake-just-bash", .{ .truncate = true });
         defer fake.close(io_mod.getIo());
         try fake.writeStreamingAll(io_mod.getIo(), fake_script);
-        try fake.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+        try fake.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o700));
     }
     const fake_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/fake-just-bash");
     defer alloc.free(fake_path);
@@ -5025,7 +5079,7 @@ test "just_bash raw callback emits parsed inner streams without wrapper JSON" {
         var fake = try tmp.dir.createFile(io_mod.getIo(), "workspace/fake-just-bash", .{ .truncate = true });
         defer fake.close(io_mod.getIo());
         try fake.writeStreamingAll(io_mod.getIo(), script);
-        try fake.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+        try fake.setPermissions(io_mod.getIo(), io_mod.permissionsFromMode(0o700));
     }
     const fake_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/fake-just-bash");
     defer alloc.free(fake_path);

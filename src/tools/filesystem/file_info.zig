@@ -262,7 +262,7 @@ fn writeTempFileWithMtime(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: 
 }
 
 fn setMode(path: []const u8, mode: std.posix.mode_t) !void {
-    try std.Io.Dir.cwd().setFilePermissions(io_mod.getIo(), path, std.Io.File.Permissions.fromMode(mode), .{});
+    try io_mod.setPathPermissions(std.Io.Dir.cwd(), io_mod.getIo(), path, io_mod.permissionsFromMode(mode), .{});
 }
 
 fn expectNoExtension(body: []const u8) !void {
@@ -468,7 +468,7 @@ test "file_info active output omits readonly" {
     defer alloc.free(path);
     setMode(path, 0o444) catch return error.SkipZigTest;
     const stat = try std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{});
-    if (!stat.permissions.readOnly()) return error.SkipZigTest;
+    if (io_mod.isPermissionWritable(stat.permissions)) return error.SkipZigTest;
     const workspace = try workspaceRoot(alloc, tmp);
     defer alloc.free(workspace);
 

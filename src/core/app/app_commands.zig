@@ -906,7 +906,7 @@ pub fn Handlers(comptime App: type) type {
             if (scope == .session) {
                 return app.session.usage.reportSnapshot(app.alloc);
             }
-            const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+            const home = io_mod.homeDir() orelse return error.HomeNotSet;
             const availability = try app.session.ensureProfileUsageReadable(
                 app.alloc,
                 home,
@@ -974,7 +974,7 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             const result = try app.mcpCommandProvider().handle(app.alloc, rest, .{
-                .home = io_mod.getenv("HOME"),
+                .home = io_mod.homeDir(),
                 .list_ctx = @ptrCast(app),
                 .summarize_servers = summarizeMcpServers,
                 .list_servers_and_tools = listMcpServersAndTools,
@@ -1690,7 +1690,7 @@ fn traceFilePermissions() std.Io.File.Permissions {
     const builtin = @import("builtin");
     return switch (builtin.os.tag) {
         .windows => .default_file,
-        else => std.Io.File.Permissions.fromMode(0o600),
+        else => io_mod.permissionsFromMode(0o600),
     };
 }
 
@@ -1922,7 +1922,7 @@ fn writeCurrentStateSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
 
 fn writeProcessSummary(writer: *std.Io.Writer, alloc: std.mem.Allocator) !void {
     const pid = std.c.getpid();
-    try writer.print("process: pid={d}", .{pid});
+    try writer.print("process: pid={d}", .{io_mod.pidNumber(pid)});
     if (countOpenFileDescriptors()) |fd_count| try writer.print(" open_fds={d}", .{fd_count});
     try writer.writeByte('\n');
 
@@ -1962,7 +1962,10 @@ fn countOpenFileDescriptors() ?usize {
 }
 
 fn processMemorySnapshot(alloc: std.mem.Allocator, pid: std.c.pid_t) ![]u8 {
-    const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{pid});
+    const builtin = @import("builtin");
+    // `ps` is a POSIX utility; Windows has no drop-in equivalent taking a pid.
+    if (comptime builtin.os.tag == .windows) return error.ProcessSnapshotFailed;
+    const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{io_mod.pidNumber(pid)});
     defer alloc.free(pid_text);
     const result = try std.process.run(alloc, io_mod.getIo(), .{
         .argv = &.{ "ps", "-o", "pid,ppid,rss,vsz,etime,stat", "-p", pid_text },
@@ -2467,7 +2470,7 @@ fn writeTraceLogTail(writer: *std.Io.Writer, alloc: std.mem.Allocator, path: []c
 
     const buf = alloc.alloc(u8, read_size) catch return;
     defer alloc.free(buf);
-    const n = file.readPositionalAll(io_mod.getIo(), buf, offset) catch return;
+    const n = io_mod.readPositionalAll(file, buf, offset) catch return;
     if (n == 0) return;
 
     try writer.print("\n## Trace Tail\npath={s} last_bytes={d}\n", .{ path, n });
@@ -4059,7 +4062,7 @@ test "trace report file uses private randomized markdown path" {
     const stat = try file.stat(std.testing.io);
     try std.testing.expectEqual(@as(u64, 6), stat.size);
     if (@import("builtin").os.tag != .windows) {
-        try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
+        try std.testing.expectEqual(@as(io_mod.Mode, 0), io_mod.permissionsModeOrZero(stat.permissions));
     }
 }
 

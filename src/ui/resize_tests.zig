@@ -119,7 +119,7 @@ pub const Harness = struct {
         const want: usize = @intCast(total - self.read_offset);
         const buf = try self.alloc.alloc(u8, want);
         defer self.alloc.free(buf);
-        const n = try self.file.readPositionalAll(io_mod.getIo(), buf, self.read_offset);
+        const n = try io_mod.readPositionalAll(self.file, buf, self.read_offset);
         try self.vt.feed(buf[0..n]);
         self.read_offset += n;
     }
@@ -7054,7 +7054,7 @@ fn readEmittedSince(h: *Harness, since_offset: u64) ![]u8 {
     const total = try h.file.length(io_mod.getIo());
     const want: usize = @intCast(total - since_offset);
     const buf = try h.alloc.alloc(u8, want);
-    _ = try h.file.readPositionalAll(io_mod.getIo(), buf, since_offset);
+    _ = try io_mod.readPositionalAll(h.file, buf, since_offset);
     return buf;
 }
 

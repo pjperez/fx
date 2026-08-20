@@ -15977,15 +15977,18 @@ fn expectResourceText(result: ResourceReadResult, expected: []const u8) !void {
 }
 
 fn expectTestProcessExited(pid: std.posix.pid_t) !void {
-    for (0..200) |_| {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-            error.ProcessNotFound => return,
-            else => {},
-        };
-        if (builtin.os.tag == .linux and testProcessIsZombie(pid)) return;
-        io_mod.sleep(10 * std.time.ns_per_ms);
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) {} else {
+        for (0..200) |_| {
+            std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+                error.ProcessNotFound => return,
+                else => {},
+            };
+            if (builtin.os.tag == .linux and testProcessIsZombie(pid)) return;
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+        return error.TestProcessStillRunning;
     }
-    return error.TestProcessStillRunning;
 }
 
 fn testProcessIsZombie(pid: std.posix.pid_t) bool {
@@ -15996,7 +15999,7 @@ fn testProcessIsZombie(pid: std.posix.pid_t) bool {
 
     var reader_buf: [512]u8 = undefined;
     var status_buf: [512]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &reader_buf);
+    var reader = io_mod.fileReader(file, &reader_buf);
     const read_len = reader.interface.readSliceShort(&status_buf) catch return false;
     return std.mem.find(u8, status_buf[0..read_len], "\nState:\tZ") != null;
 }
@@ -16040,7 +16043,7 @@ test "connectServer completes NDJSON handshake against a real stdio server" {
     try std.testing.expectEqual(@as(usize, 1), server.tool_catalog.tools.items.len);
     try std.testing.expectEqualStrings("echo", server.tool_catalog.tools.items[0].original_name);
     try std.testing.expectEqualStrings("mcp_ndjson_echo", server.tool_catalog.tools.items[0].prefixed_name);
-    const grandchild_pid = try std.fmt.parseInt(std.posix.pid_t, server.instructions.?, 10);
+    const grandchild_pid = try io_mod.parsePidText(server.instructions.?);
 
     server.disconnect();
     try expectTestProcessExited(grandchild_pid);

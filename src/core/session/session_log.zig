@@ -18,8 +18,8 @@ const session_usage_sidecar = @import("session_usage_sidecar.zig");
 
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = io_mod.permissionsFromMode(0o700);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 const lock_deadline_ms: u64 = 2000;
 const authority_max_bytes: usize = 16 * 1024;
 const authority_intent_max_bytes: usize = 32 * 1024;
@@ -1049,7 +1049,7 @@ pub const Root = struct {
         };
         defer durable_home.close(zio);
         if (mode == .writable) {
-            durable_home.setPermissions(zio, private_dir_permissions) catch
+            io_mod.setDirPermissions(durable_home, zio, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(durable_home, mode);
@@ -1081,7 +1081,7 @@ pub const Root = struct {
         };
         errdefer sessions_dir.close(zio);
         if (mode == .writable) {
-            sessions_dir.setPermissions(zio, private_dir_permissions) catch
+            io_mod.setDirPermissions(sessions_dir, zio, private_dir_permissions) catch
                 return error.PrivateStatePermissionsUnsupported;
         }
         try verifyPrivateDir(sessions_dir, mode);
@@ -1400,7 +1400,7 @@ fn validateLeaf(name: []const u8) !void {
 fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (mode == .writable and stat.permissions.toMode() & 0o777 != 0o700) {
+    if (mode == .writable and !io_mod.hasMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1408,7 +1408,7 @@ fn verifyPrivateDir(dir: std.Io.Dir, mode: OpenMode) !void {
 fn verifyManagedFile(file: std.Io.File, mode: OpenMode) !void {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
-    if (mode == .writable and stat.permissions.toMode() & 0o777 != 0o600) {
+    if (mode == .writable and !io_mod.hasMode(stat.permissions, 0o600)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -1428,7 +1428,7 @@ fn openSessionDir(
     };
     errdefer dir.close(io_mod.getIo());
     if (mode == .writable) {
-        dir.setPermissions(io_mod.getIo(), private_dir_permissions) catch
+        io_mod.setDirPermissions(dir, io_mod.getIo(), private_dir_permissions) catch
             return error.PrivateStatePermissionsUnsupported;
     }
     try verifyPrivateDir(dir, mode);
@@ -2168,7 +2168,7 @@ fn createNativeSession(
     var event_log = createManagedFile(&writable.dir, events_file) catch
         return error.SessionStartFailed;
     defer event_log.close(io_mod.getIo());
-    event_log.writePositionalAll(io_mod.getIo(), line, 0) catch
+    io_mod.writePositionalAll(event_log, line, 0) catch
         return error.SessionStartFailed;
     options.test_controls.boundary(.after_event_append) catch
         return error.SessionStartFailed;
@@ -3225,8 +3225,8 @@ fn publishFrames(
     if (current_length == proposed.through_event_log_bytes) {
         const existing = try alloc.alloc(u8, frames.len);
         defer alloc.free(existing);
-        const count = try log.readPositionalAll(
-            io_mod.getIo(),
+        const count = try io_mod.readPositionalAll(
+            log,
             existing,
             prior.through_event_log_bytes,
         );
@@ -3240,8 +3240,8 @@ fn publishFrames(
             try log.setLength(io_mod.getIo(), prior.through_event_log_bytes);
             try log.sync(io_mod.getIo());
         }
-        log.writePositionalAll(
-            io_mod.getIo(),
+        io_mod.writePositionalAll(
+            log,
             frames,
             prior.through_event_log_bytes,
         ) catch return handlePreIntentFailure(log, prior, failed_tail);
@@ -3682,8 +3682,8 @@ fn expectedTailMatches(
     if (length != failed.proposed.through_event_log_bytes) return false;
     const actual = try alloc.alloc(u8, failed.bytes.len);
     defer alloc.free(actual);
-    const count = try log.readPositionalAll(
-        io_mod.getIo(),
+    const count = try io_mod.readPositionalAll(
+        log,
         actual,
         failed.prior.through_event_log_bytes,
     );
@@ -4023,7 +4023,7 @@ fn eventStat(
         .device = try eventDevice(file),
         .inode = @intCast(stat.inode),
         .kind = .regular,
-        .mode = stat.permissions.toMode(),
+        .mode = io_mod.permissionsModeOrZero(stat.permissions),
         .link_count = @intCast(stat.nlink),
         .size = stat.size,
         .mtime_ns = stat.mtime.nanoseconds,
@@ -4174,7 +4174,7 @@ fn compactCanonicalLog(
     defer alloc.free(temp_name);
     var temp = try createManagedFile(&loaded.log.dir, temp_name);
     defer temp.close(io_mod.getIo());
-    try temp.writePositionalAll(io_mod.getIo(), content.written(), 0);
+    try io_mod.writePositionalAll(temp, content.written(), 0);
     try temp.sync(io_mod.getIo());
     try options.test_controls.boundary(.after_compaction_temp_sync);
     const proposed = CommitPosition{
@@ -4325,7 +4325,7 @@ fn makeCleanupCandidatesForTest(
     errdefer alloc.free(temp_name);
     var file = try createManagedFile(&loaded.log.dir, temp_name);
     defer file.close(io_mod.getIo());
-    try file.writePositionalAll(io_mod.getIo(), line, 0);
+    try io_mod.writePositionalAll(file, line, 0);
     try file.sync(io_mod.getIo());
     const position = CommitPosition{
         .log_generation = generation,
@@ -4383,7 +4383,7 @@ fn cleanupOrphansImpl(
             continue;
         };
         if (stat.kind != .file or stat.nlink != 1 or
-            stat.permissions.toMode() & 0o777 != 0o600)
+            !io_mod.hasMode(stat.permissions, 0o600))
         {
             report.ignored += 1;
             continue;
@@ -4588,7 +4588,7 @@ const TempRoot = struct {
     fn init(alloc: Allocator) !TempRoot {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        try tmp.dir.createDir(io_mod.getIo(), "home", std.Io.File.Permissions.fromMode(0o700));
+        try tmp.dir.createDir(io_mod.getIo(), "home", io_mod.permissionsFromMode(0o700));
         const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
         errdefer alloc.free(home);
         var root = try Root.initFromHome(alloc, home, .writable);
@@ -4746,7 +4746,7 @@ fn replaceFrameByteForTest(
     const match = std.mem.find(u8, line.bytes, needle) orelse
         return error.TestUnexpectedResult;
     line.bytes[match + needle.len - 1] = replacement;
-    try log.writePositionalAll(io_mod.getIo(), line.bytes, frame_offset);
+    try io_mod.writePositionalAll(log, line.bytes, frame_offset);
     try log.sync(io_mod.getIo());
 }
 
@@ -4773,7 +4773,7 @@ fn corruptReplacementCommitTimestampForTest(
             const match = std.mem.find(u8, line.bytes, needle) orelse
                 return error.TestUnexpectedResult;
             line.bytes[match + needle.len - 1] = '1';
-            try log.writePositionalAll(io_mod.getIo(), line.bytes, offset);
+            try io_mod.writePositionalAll(log, line.bytes, offset);
             try log.sync(io_mod.getIo());
             return;
         }
@@ -5152,7 +5152,7 @@ test "unwritable usage sidecar keeps canonical usage resumable and incomplete" {
     try loaded.log.dir.dir.createDir(
         io_mod.getIo(),
         session_usage_sidecar.sidecar_file,
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
 
     var usage = session_usage.Usage.initFresh();
@@ -6102,8 +6102,8 @@ test "degraded retry replaces current state when the expected tail is not exact"
     const prior = failed.prior;
     const failed_proposed = failed.proposed;
     var log = try openManagedFile(&loaded.log.dir, events_file, .read_write);
-    try log.writePositionalAll(
-        io_mod.getIo(),
+    try io_mod.writePositionalAll(
+        log,
         "!",
         prior.through_event_log_bytes,
     );
@@ -6556,9 +6556,9 @@ test "writable open state preserves compaction accounting after a stale event fi
     var first: [1]u8 = undefined;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try log.readPositionalAll(io_mod.getIo(), &first, 0),
+        try io_mod.readPositionalAll(log, &first, 0),
     );
-    try log.writePositionalAll(io_mod.getIo(), &first, 0);
+    try io_mod.writePositionalAll(log, &first, 0);
     try log.sync(io_mod.getIo());
 
     var opened = try loadOpenState(
@@ -7135,7 +7135,7 @@ test "orphan cleanup preserves a generated temp with malformed trailing bytes" {
     );
     defer malformed.close(io_mod.getIo());
     const length = try malformed.length(io_mod.getIo());
-    try malformed.writePositionalAll(io_mod.getIo(), "not-json\n", length);
+    try io_mod.writePositionalAll(malformed, "not-json\n", length);
     try malformed.sync(io_mod.getIo());
 
     const report = try loaded.cleanupOrphans(alloc, .delete);

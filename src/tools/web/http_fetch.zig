@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const url_policy = @import("url_policy.zig");
@@ -6,6 +7,12 @@ const url_policy = @import("url_policy.zig");
 const Allocator = std.mem.Allocator;
 const IpAddress = std.Io.net.IpAddress;
 const posix = std.posix;
+
+/// The pinned-address connector below is written directly against POSIX sockets:
+/// `errno` classification, `fcntl` non-blocking setup and `poll` readiness all
+/// have Winsock spellings that do not line up one for one. Windows therefore has
+/// no built-in transport yet and `web_fetch` reports itself unavailable there.
+pub const posix_transport_supported = builtin.os.tag != .windows;
 
 pub const max_body_bytes: usize = 10 * 1024 * 1024;
 const max_redirect_hops: usize = 10;
@@ -450,21 +457,25 @@ fn isRetryableConnectError(err: anyerror) bool {
 }
 
 fn connectDefault(_: *anyopaque, alloc: Allocator, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
-    const effective = normalizedOptions(options);
-    const dialer: Dialer = .{
-        .ctx = @ptrCast(&default_connector_ctx),
-        .connect_fn = connectDefaultDialer,
-    };
-    const fd = connectAdmitted(target.admitted_addresses, effective, dialer) catch |err| {
-        traceFailure(.connect, err);
-        return err;
-    };
-    defer closeFd(fd);
+    if (comptime !posix_transport_supported) {
+        return error.WebFetchTransportUnsupported;
+    } else {
+        const effective = normalizedOptions(options);
+        const dialer: Dialer = .{
+            .ctx = @ptrCast(&default_connector_ctx),
+            .connect_fn = connectDefaultDialer,
+        };
+        const fd = connectAdmitted(target.admitted_addresses, effective, dialer) catch |err| {
+            traceFailure(.connect, err);
+            return err;
+        };
+        defer closeFd(fd);
 
-    return switch (target.url.scheme) {
-        .http => try fetchPlain(alloc, fd, target, effective),
-        .https => try fetchTls(alloc, fd, target, effective),
-    };
+        return switch (target.url.scheme) {
+            .http => try fetchPlain(alloc, fd, target, effective),
+            .https => try fetchTls(alloc, fd, target, effective),
+        };
+    }
 }
 
 fn fetchPlain(alloc: Allocator, fd: posix.fd_t, target: PinnedTarget, options: FetchOptions) anyerror!ConnectorResponse {
@@ -1222,29 +1233,31 @@ fn readChunkedTrailers(reader: *BodyReader, alloc: Allocator) !void {
 }
 
 fn connectPinned(address: IpAddress, options: FetchOptions) !posix.fd_t {
-    try checkControl(options);
-    const family: posix.sa_family_t = switch (address) {
-        .ip4 => posix.AF.INET,
-        .ip6 => posix.AF.INET6,
-    };
-    const fd = try openSocket(family);
-    errdefer closeFd(fd);
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        try checkControl(options);
+        const family: posix.sa_family_t = switch (address) {
+            .ip4 => posix.AF.INET,
+            .ip6 => posix.AF.INET6,
+        };
+        const fd = try openSocket(family);
+        errdefer closeFd(fd);
 
-    var storage: PosixAddress = undefined;
-    const len = addressToPosix(address, &storage);
-    while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
-        .SUCCESS => return fd,
-        .INTR => {
-            try checkControl(options);
-            continue;
-        },
-        .INPROGRESS, .AGAIN, .ALREADY => {
-            try pollFd(fd, posix.POLL.OUT, options);
-            try checkSocketError(fd);
-            return fd;
-        },
-        else => |err| return classifyConnectErrno(err),
-    };
+        var storage: PosixAddress = undefined;
+        const len = addressToPosix(address, &storage);
+        while (true) switch (posix.errno(posix.system.connect(fd, &storage.any, len))) {
+            .SUCCESS => return fd,
+            .INTR => {
+                try checkControl(options);
+                continue;
+            },
+            .INPROGRESS, .AGAIN, .ALREADY => {
+                try pollFd(fd, poll_out, options);
+                try checkSocketError(fd);
+                return fd;
+            },
+            else => |err| return classifyConnectErrno(err),
+        };
+    }
 }
 
 fn classifyConnectErrno(err: posix.E) anyerror {
@@ -1270,87 +1283,99 @@ const PosixAddress = extern union {
 };
 
 fn addressToPosix(address: IpAddress, storage: *PosixAddress) posix.socklen_t {
-    return switch (address) {
-        .ip4 => |ip4| {
-            storage.in = .{
-                .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
-            };
-            return @sizeOf(posix.sockaddr.in);
-        },
-        .ip6 => |ip6| {
-            storage.in6 = .{
-                .port = std.mem.nativeToBig(u16, ip6.port),
-                .flowinfo = ip6.flow,
-                .addr = ip6.bytes,
-                .scope_id = ip6.interface.index,
-            };
-            return @sizeOf(posix.sockaddr.in6);
-        },
-    };
+    if (comptime !posix_transport_supported) return 0 else {
+        return switch (address) {
+            .ip4 => |ip4| {
+                storage.in = .{
+                    .port = std.mem.nativeToBig(u16, ip4.port),
+                    .addr = @bitCast(ip4.bytes),
+                };
+                return @sizeOf(posix.sockaddr.in);
+            },
+            .ip6 => |ip6| {
+                storage.in6 = .{
+                    .port = std.mem.nativeToBig(u16, ip6.port),
+                    .flowinfo = ip6.flow,
+                    .addr = ip6.bytes,
+                    .scope_id = ip6.interface.index,
+                };
+                return @sizeOf(posix.sockaddr.in6);
+            },
+        };
+    }
 }
 
 fn openSocket(family: posix.sa_family_t) !posix.fd_t {
-    const fd = while (true) {
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
-            .INTR => continue,
-            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-            .MFILE => return error.ProcessFdQuotaExceeded,
-            .NFILE => return error.SystemFdQuotaExceeded,
-            .NOBUFS, .NOMEM => return error.SystemResources,
-            else => return error.SocketOpenFailed,
-        }
-    };
-    errdefer closeFd(fd);
-    try setCloexec(fd);
-    try setNonblocking(fd);
-    return fd;
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        const fd = while (true) {
+            const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
+            switch (posix.errno(rc)) {
+                .SUCCESS => break @as(posix.fd_t, @intCast(rc)),
+                .INTR => continue,
+                .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                else => return error.SocketOpenFailed,
+            }
+        };
+        errdefer closeFd(fd);
+        try setCloexec(fd);
+        try setNonblocking(fd);
+        return fd;
+    }
 }
 
 fn setCloexec(fd: posix.fd_t) !void {
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return error.SocketOptionFailed,
-    };
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return error.SocketOptionFailed,
+        };
+    }
 }
 
 fn setNonblocking(fd: posix.fd_t) !void {
-    const current = while (true) {
-        const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
-        switch (posix.errno(rc)) {
-            .SUCCESS => break rc,
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        const current = while (true) {
+            const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+            switch (posix.errno(rc)) {
+                .SUCCESS => break rc,
+                .INTR => continue,
+                else => return error.SocketOptionFailed,
+            }
+        };
+        const current_flags: usize = @intCast(current);
+        const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
+        const next: usize = current_flags | nonblock_flag;
+        while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, next))) {
+            .SUCCESS => return,
             .INTR => continue,
             else => return error.SocketOptionFailed,
-        }
-    };
-    const current_flags: usize = @intCast(current);
-    const nonblock_flag: usize = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
-    const next: usize = current_flags | nonblock_flag;
-    while (true) switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, next))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return error.SocketOptionFailed,
-    };
+        };
+    }
 }
 
 fn checkSocketError(fd: posix.fd_t) !void {
-    var value: c_int = 0;
-    var len: std.c.socklen_t = @sizeOf(c_int);
-    if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0) return error.ConnectionFailed;
-    if (value == 0) return;
-    const socket_error: posix.E = @enumFromInt(value);
-    return classifyConnectErrno(socket_error);
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        var value: c_int = 0;
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0) return error.ConnectionFailed;
+        if (value == 0) return;
+        const socket_error: posix.E = @enumFromInt(value);
+        return classifyConnectErrno(socket_error);
+    }
 }
 
 fn closeFd(fd: posix.fd_t) void {
-    while (true) switch (posix.errno(posix.system.close(fd))) {
-        .SUCCESS => return,
-        .INTR => continue,
-        else => return,
-    };
+    if (comptime !posix_transport_supported) {} else {
+        while (true) switch (posix.errno(posix.system.close(fd))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        };
+    }
 }
 
 fn traceFailure(stage: FailureStage, err: anyerror) void {
@@ -1491,23 +1516,40 @@ fn DeadlineWriter(comptime buffer_len: usize) type {
 
 const PollError = posix.PollError || error{Interrupted};
 
-const Poller = struct {
-    ctx: ?*anyopaque,
-    poll_fn: *const fn (?*anyopaque, []posix.pollfd, i32) PollError!usize,
+/// `std.posix.pollfd` and `std.posix.POLL` do not exist on Windows. The
+/// pinned-address transport is unavailable there, but its signatures still have
+/// to name a type.
+const Pollfd = if (posix_transport_supported) posix.pollfd else extern struct {
+    fd: posix.fd_t,
+    events: i16,
+    revents: i16,
 };
 
-fn pollDefault(_: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
-    const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
-        return error.SystemResources;
-    const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => @intCast(rc),
-        .INTR => error.Interrupted,
-        .NOMEM => error.SystemResources,
-        .NETDOWN => error.NetworkDown,
-        .FAULT, .INVAL => unreachable,
-        else => |err| posix.unexpectedErrno(err),
-    };
+const poll_in: i16 = if (posix_transport_supported) posix.POLL.IN else 1;
+const poll_out: i16 = if (posix_transport_supported) posix.POLL.OUT else 4;
+const poll_err: i16 = if (posix_transport_supported) posix.POLL.ERR else 8;
+const poll_hup: i16 = if (posix_transport_supported) posix.POLL.HUP else 16;
+const poll_nval: i16 = if (posix_transport_supported) posix.POLL.NVAL else 32;
+
+const Poller = struct {
+    ctx: ?*anyopaque,
+    poll_fn: *const fn (?*anyopaque, []Pollfd, i32) PollError!usize,
+};
+
+fn pollDefault(_: ?*anyopaque, fds: []Pollfd, timeout_ms: i32) PollError!usize {
+    if (comptime !posix_transport_supported) return error.Interrupted else {
+        const fds_count = std.math.cast(posix.nfds_t, fds.len) orelse
+            return error.SystemResources;
+        const rc = posix.system.poll(fds.ptr, fds_count, timeout_ms);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => error.Interrupted,
+            .NOMEM => error.SystemResources,
+            .NETDOWN => error.NetworkDown,
+            .FAULT, .INVAL => unreachable,
+            else => |err| posix.unexpectedErrno(err),
+        };
+    }
 }
 
 const default_poller: Poller = .{
@@ -1531,11 +1573,13 @@ const ReadSyscall = struct {
 };
 
 fn readDefault(_: ?*anyopaque, fd: posix.fd_t, buf: []u8) RawSyscallResult {
-    const rc = posix.system.read(fd, buf.ptr, buf.len);
-    return switch (posix.errno(rc)) {
-        .SUCCESS => .{ .count = @intCast(rc) },
-        else => |err| .{ .failure = err },
-    };
+    if (comptime !posix_transport_supported) return .{ .failure = .NOSYS } else {
+        const rc = posix.system.read(fd, buf.ptr, buf.len);
+        return switch (posix.errno(rc)) {
+            .SUCCESS => .{ .count = @intCast(rc) },
+            else => |err| .{ .failure = err },
+        };
+    }
 }
 
 const default_read_syscall: ReadSyscall = .{
@@ -1586,17 +1630,19 @@ fn rawReadWith(
     poller: Poller,
     syscall: ReadSyscall,
 ) !usize {
-    while (true) {
-        try pollFdWith(fd, posix.POLL.IN, options, poller);
-        switch (syscall.read_fn(syscall.ctx, fd, buf)) {
-            .count => |count| return count,
-            .failure => |err| switch (classifyReadErrno(err)) {
-                .retry => {
-                    if (err == .INTR) try checkControl(options);
-                    continue;
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        while (true) {
+            try pollFdWith(fd, poll_in, options, poller);
+            switch (syscall.read_fn(syscall.ctx, fd, buf)) {
+                .count => |count| return count,
+                .failure => |err| switch (classifyReadErrno(err)) {
+                    .retry => {
+                        if (err == .INTR) try checkControl(options);
+                        continue;
+                    },
+                    .failure => |root| return root,
                 },
-                .failure => |root| return root,
-            },
+            }
         }
     }
 }
@@ -1606,26 +1652,28 @@ fn rawWriteAll(fd: posix.fd_t, bytes: []const u8, options: FetchOptions) !void {
 }
 
 fn rawWriteAllWith(fd: posix.fd_t, bytes: []const u8, options: FetchOptions, poller: Poller) !void {
-    var written: usize = 0;
-    while (written < bytes.len) {
-        try pollFdWith(fd, posix.POLL.OUT, options, poller);
-        const rc = std.c.send(
-            fd,
-            bytes[written..].ptr,
-            bytes.len - written,
-            @intCast(posix.MSG.NOSIGNAL),
-        );
-        const errno = posix.errno(rc);
-        if (errno != .SUCCESS) switch (classifyWriteErrno(errno)) {
-            .retry => {
-                if (errno == .INTR) try checkControl(options);
-                continue;
-            },
-            .failure => |root| return root,
-        };
-        const n: usize = @intCast(rc);
-        if (n == 0) return error.UnexpectedClose;
-        written += n;
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            try pollFdWith(fd, poll_out, options, poller);
+            const rc = std.c.send(
+                fd,
+                bytes[written..].ptr,
+                bytes.len - written,
+                @intCast(posix.MSG.NOSIGNAL),
+            );
+            const errno = posix.errno(rc);
+            if (errno != .SUCCESS) switch (classifyWriteErrno(errno)) {
+                .retry => {
+                    if (errno == .INTR) try checkControl(options);
+                    continue;
+                },
+                .failure => |root| return root,
+            };
+            const n: usize = @intCast(rc);
+            if (n == 0) return error.UnexpectedClose;
+            written += n;
+        }
     }
 }
 
@@ -1634,59 +1682,63 @@ fn pollFd(fd: posix.fd_t, events: i16, options: FetchOptions) !void {
 }
 
 fn pollFdWith(fd: posix.fd_t, events: i16, options: FetchOptions, poller: Poller) !void {
-    while (true) {
-        var fds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = events,
-            .revents = 0,
-        }};
-        const ready = poller.poll_fn(
-            poller.ctx,
-            &fds,
-            try pollTimeoutMs(options),
-        ) catch |err| switch (err) {
-            error.Interrupted => {
-                try checkControl(options);
-                continue;
-            },
-            else => return err,
-        };
-        if (ready == 0) continue;
-        return classifyPollEvents(fd, events, fds[0].revents);
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        while (true) {
+            var fds = [_]Pollfd{.{
+                .fd = fd,
+                .events = events,
+                .revents = 0,
+            }};
+            const ready = poller.poll_fn(
+                poller.ctx,
+                &fds,
+                try pollTimeoutMs(options),
+            ) catch |err| switch (err) {
+                error.Interrupted => {
+                    try checkControl(options);
+                    continue;
+                },
+                else => return err,
+            };
+            if (ready == 0) continue;
+            return classifyPollEvents(fd, events, fds[0].revents);
+        }
     }
 }
 
 fn classifyPollEvents(fd: posix.fd_t, events: i16, revents: i16) !void {
-    if ((revents & posix.POLL.NVAL) != 0) return error.InvalidDescriptor;
+    if ((revents & poll_nval) != 0) return error.InvalidDescriptor;
     if ((revents & events) != 0) return;
-    if (events == posix.POLL.IN and (revents & posix.POLL.HUP) != 0) return;
-    if ((revents & posix.POLL.ERR) != 0) return pollSocketError(fd);
-    if ((revents & posix.POLL.HUP) != 0) return error.UnexpectedClose;
+    if (events == poll_in and (revents & poll_hup) != 0) return;
+    if ((revents & poll_err) != 0) return pollSocketError(fd);
+    if ((revents & poll_hup) != 0) return error.UnexpectedClose;
     return error.UnexpectedClose;
 }
 
 fn pollSocketError(fd: posix.fd_t) !void {
-    var value: c_int = 0;
-    var len: std.c.socklen_t = @sizeOf(c_int);
-    if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0)
-        return error.UnexpectedClose;
-    if (value == 0) return error.UnexpectedClose;
-    const socket_error: posix.E = @enumFromInt(value);
-    return switch (socket_error) {
-        .CONNREFUSED => error.ConnectionRefused,
-        .CONNRESET => error.ConnectionResetByPeer,
-        .TIMEDOUT => error.Timeout,
-        .NETDOWN => error.NetworkDown,
-        .NETUNREACH => error.NetworkUnreachable,
-        .HOSTUNREACH => error.HostUnreachable,
-        .PIPE => error.BrokenPipe,
-        .NOTCONN => error.SocketUnconnected,
-        .NOBUFS, .NOMEM => error.SystemResources,
-        .IO => error.InputOutput,
-        .BADF => error.InvalidDescriptor,
-        .CANCELED => error.Canceled,
-        else => error.UnexpectedClose,
-    };
+    if (comptime !posix_transport_supported) return error.WebFetchTransportUnsupported else {
+        var value: c_int = 0;
+        var len: std.c.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0)
+            return error.UnexpectedClose;
+        if (value == 0) return error.UnexpectedClose;
+        const socket_error: posix.E = @enumFromInt(value);
+        return switch (socket_error) {
+            .CONNREFUSED => error.ConnectionRefused,
+            .CONNRESET => error.ConnectionResetByPeer,
+            .TIMEDOUT => error.Timeout,
+            .NETDOWN => error.NetworkDown,
+            .NETUNREACH => error.NetworkUnreachable,
+            .HOSTUNREACH => error.HostUnreachable,
+            .PIPE => error.BrokenPipe,
+            .NOTCONN => error.SocketUnconnected,
+            .NOBUFS, .NOMEM => error.SystemResources,
+            .IO => error.InputOutput,
+            .BADF => error.InvalidDescriptor,
+            .CANCELED => error.Canceled,
+            else => error.UnexpectedClose,
+        };
+    }
 }
 
 fn pollTimeoutMs(options: FetchOptions) !i32 {
@@ -2333,19 +2385,21 @@ test "web_fetch content length and close delimited bodies enforce exact caps" {
 }
 
 test "web_fetch chunked body rejects cumulative announced size before reading payload" {
-    const alloc = std.testing.allocator;
-    const payloads = [_][]const u8{
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n",
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n2\r\n",
-    };
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        const payloads = [_][]const u8{
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n2\r\n",
+        };
 
-    for (payloads) |payload| {
-        var reader: std.Io.Reader = .fixed(payload);
-        var failure_stage: FailureStage = .response_head;
-        try std.testing.expectError(
-            error.BodyTooLarge,
-            readResponse(alloc, &reader, 4, .{}, &failure_stage),
-        );
+        for (payloads) |payload| {
+            var reader: std.Io.Reader = .fixed(payload);
+            var failure_stage: FailureStage = .response_head;
+            try std.testing.expectError(
+                error.BodyTooLarge,
+                readResponse(alloc, &reader, 4, .{}, &failure_stage),
+            );
+        }
     }
 }
 
@@ -2503,18 +2557,22 @@ fn pipeBackedTlsBoundaryReader(
     transport_reader: *PlainDeadlineReader,
     boundary_reader: *ScriptedTlsBoundaryReader,
 ) !posix.fd_t {
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    errdefer closeFd(fds[0]);
-    errdefer closeFd(fds[1]);
+    // Anonymous pipes are POSIX-only; the tests using this helper are skipped
+    // on Windows.
+    if (comptime builtin.os.tag == .windows) return error.PipeFailed else {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        errdefer closeFd(fds[0]);
+        errdefer closeFd(fds[1]);
 
-    const written = std.c.write(fds[1], payload.ptr, payload.len);
-    if (written < 0 or @as(usize, @intCast(written)) != payload.len) return error.PipeWriteFailed;
-    closeFd(fds[1]);
+        const written = std.c.write(fds[1], payload.ptr, payload.len);
+        if (written < 0 or @as(usize, @intCast(written)) != payload.len) return error.PipeWriteFailed;
+        closeFd(fds[1]);
 
-    transport_reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
-    boundary_reader.init(&transport_reader.interface, eof_mode);
-    return fds[0];
+        transport_reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
+        boundary_reader.init(&transport_reader.interface, eof_mode);
+        return fds[0];
+    }
 }
 
 test "web_fetch TLS boundary completes self delimited response without reading eof" {
@@ -2643,32 +2701,36 @@ test "web_fetch response parser ignores pending bytes beyond content length" {
 }
 
 test "web_fetch TLS encrypted transport buffers satisfy stdlib minimums" {
-    var reader: TlsDeadlineReader = undefined;
-    reader.init(-1, .{});
-    try std.testing.expect(reader.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var reader: TlsDeadlineReader = undefined;
+        reader.init(-1, .{});
+        try std.testing.expect(reader.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
 
-    var writer: TlsDeadlineWriter = undefined;
-    writer.init(-1, .{});
-    try std.testing.expect(writer.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
+        var writer: TlsDeadlineWriter = undefined;
+        writer.init(-1, .{});
+        try std.testing.expect(writer.interface.buffer.len >= std.crypto.tls.Client.min_buffer_len);
+    }
 }
 
 test "web_fetch TLS deadline reader fills internal buffer for zero length readVec" {
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    defer closeFd(fds[0]);
-    defer closeFd(fds[1]);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        defer closeFd(fds[0]);
+        defer closeFd(fds[1]);
 
-    const payload = "HTTP";
-    const written = std.c.write(fds[1], payload.ptr, payload.len);
-    if (written < 0) return error.PipeWriteFailed;
-    try std.testing.expectEqual(payload.len, @as(usize, @intCast(written)));
+        const payload = "HTTP";
+        const written = std.c.write(fds[1], payload.ptr, payload.len);
+        if (written < 0) return error.PipeWriteFailed;
+        try std.testing.expectEqual(payload.len, @as(usize, @intCast(written)));
 
-    var reader: TlsDeadlineReader = undefined;
-    reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
+        var reader: TlsDeadlineReader = undefined;
+        reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
 
-    var empty: [1][]u8 = .{""};
-    try std.testing.expectEqual(@as(usize, 0), try reader.interface.vtable.readVec(&reader.interface, &empty));
-    try std.testing.expectEqualStrings(payload, reader.interface.buffer[reader.interface.seek..reader.interface.end]);
+        var empty: [1][]u8 = .{""};
+        try std.testing.expectEqual(@as(usize, 0), try reader.interface.vtable.readVec(&reader.interface, &empty));
+        try std.testing.expectEqualStrings(payload, reader.interface.buffer[reader.interface.seek..reader.interface.end]);
+    }
 }
 
 const ResponseSpec = struct {
@@ -3371,83 +3433,85 @@ fn expectAndTraceTlsTruncation(
 }
 
 test "web_fetch transport traces stable stages and redact sensitive values" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-fetch-transport.log" });
-    defer alloc.free(trace_path);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+        defer alloc.free(root);
+        const trace_path = try std.fs.path.join(alloc, &.{ root, "web-fetch-transport.log" });
+        defer alloc.free(trace_path);
 
-    debug_trace.resetForTest();
-    defer debug_trace.resetForTest();
-    try debug_trace.configureForTestWithScopes(alloc, trace_path, "tool");
+        debug_trace.resetForTest();
+        defer debug_trace.resetForTest();
+        try debug_trace.configureForTestWithScopes(alloc, trace_path, "tool");
 
-    traceFailure(.connect, error.ConnectionRefused);
-    traceFailure(.tls_handshake, error.CertificateVerificationFailed);
-    traceFailure(.request_write, error.BrokenPipe);
+        traceFailure(.connect, error.ConnectionRefused);
+        traceFailure(.tls_handshake, error.CertificateVerificationFailed);
+        traceFailure(.request_write, error.BrokenPipe);
 
-    var malformed_reader: std.Io.Reader = .fixed(
-        "NOT-HTTP 200 OK\r\nContent-Length: 0\r\n\r\n",
-    );
-    try expectAndTraceResponseFailure(
-        &malformed_reader,
-        .response_head,
-        error.InvalidHttpResponse,
-    );
+        var malformed_reader: std.Io.Reader = .fixed(
+            "NOT-HTTP 200 OK\r\nContent-Length: 0\r\n\r\n",
+        );
+        try expectAndTraceResponseFailure(
+            &malformed_reader,
+            .response_head,
+            error.InvalidHttpResponse,
+        );
 
-    var transport_reader: PlainDeadlineReader = undefined;
-    var boundary_reader: ScriptedTlsBoundaryReader = undefined;
-    const truncated_fd = try pipeBackedTlsBoundaryReader(
-        "HTTP/1.1 200 OK\r\n\r\nRESPONSE_BODY_MARKER",
-        .truncated,
-        &transport_reader,
-        &boundary_reader,
-    );
-    defer closeFd(truncated_fd);
-    try expectAndTraceTlsTruncation(&transport_reader, &boundary_reader);
+        var transport_reader: PlainDeadlineReader = undefined;
+        var boundary_reader: ScriptedTlsBoundaryReader = undefined;
+        const truncated_fd = try pipeBackedTlsBoundaryReader(
+            "HTTP/1.1 200 OK\r\n\r\nRESPONSE_BODY_MARKER",
+            .truncated,
+            &transport_reader,
+            &boundary_reader,
+        );
+        defer closeFd(truncated_fd);
+        try expectAndTraceTlsTruncation(&transport_reader, &boundary_reader);
 
-    const addresses = [_]IpAddress{
-        try ip("93.184.216.34", 443),
-        try ip("93.184.216.35", 443),
-    };
-    var scripted = ScriptedDialer{
-        .errors = &.{ error.ConnectionRefused, error.NetworkUnreachable },
-        .returned_fds = &.{ -1, -1 },
-    };
-    try std.testing.expectError(error.NetworkUnreachable, connectAdmitted(
-        &addresses,
-        .{},
-        scripted.dialer(),
-    ));
-    debug_trace.shutdown();
+        const addresses = [_]IpAddress{
+            try ip("93.184.216.34", 443),
+            try ip("93.184.216.35", 443),
+        };
+        var scripted = ScriptedDialer{
+            .errors = &.{ error.ConnectionRefused, error.NetworkUnreachable },
+            .returned_fds = &.{ -1, -1 },
+        };
+        try std.testing.expectError(error.NetworkUnreachable, connectAdmitted(
+            &addresses,
+            .{},
+            scripted.dialer(),
+        ));
+        debug_trace.shutdown();
 
-    var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
-    defer trace_file.close(io_mod.getIo());
-    const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
-    defer alloc.free(trace);
+        var trace_file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), trace_path, .{});
+        defer trace_file.close(io_mod.getIo());
+        const trace = try io_mod.readFileToEnd(alloc, &trace_file, 64 * 1024);
+        defer alloc.free(trace);
 
-    const expected = [_][]const u8{
-        "[tool] web_fetch transport failed stage=connect err=ConnectionRefused",
-        "[tool] web_fetch transport failed stage=tls_handshake err=CertificateVerificationFailed",
-        "[tool] web_fetch transport failed stage=request_write err=BrokenPipe",
-        "[tool] web_fetch transport failed stage=response_head err=InvalidHttpResponse",
-        "[tool] web_fetch transport failed stage=response_body err=TlsConnectionTruncated",
-        "[tool] web_fetch dial failed stage=connect attempt=1/2 err=ConnectionRefused",
-        "[tool] web_fetch dial failed stage=connect attempt=2/2 err=NetworkUnreachable",
-    };
-    for (expected) |needle| {
-        try std.testing.expect(std.mem.find(u8, trace, needle) != null);
-    }
+        const expected = [_][]const u8{
+            "[tool] web_fetch transport failed stage=connect err=ConnectionRefused",
+            "[tool] web_fetch transport failed stage=tls_handshake err=CertificateVerificationFailed",
+            "[tool] web_fetch transport failed stage=request_write err=BrokenPipe",
+            "[tool] web_fetch transport failed stage=response_head err=InvalidHttpResponse",
+            "[tool] web_fetch transport failed stage=response_body err=TlsConnectionTruncated",
+            "[tool] web_fetch dial failed stage=connect attempt=1/2 err=ConnectionRefused",
+            "[tool] web_fetch dial failed stage=connect attempt=2/2 err=NetworkUnreachable",
+        };
+        for (expected) |needle| {
+            try std.testing.expect(std.mem.find(u8, trace, needle) != null);
+        }
 
-    const sensitive = [_][]const u8{
-        "signature-value",
-        "RESPONSE_BODY_MARKER",
-        "Authorization: Bearer secret",
-        "credential-marker",
-    };
-    for (sensitive) |needle| {
-        try std.testing.expect(std.mem.find(u8, trace, needle) == null);
+        const sensitive = [_][]const u8{
+            "signature-value",
+            "RESPONSE_BODY_MARKER",
+            "Authorization: Bearer secret",
+            "credential-marker",
+        };
+        for (sensitive) |needle| {
+            try std.testing.expect(std.mem.find(u8, trace, needle) == null);
+        }
     }
 }
 
@@ -3482,86 +3546,90 @@ const ScriptedDialer = struct {
 };
 
 test "web_fetch admitted dialing preserves order and one shared deadline" {
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    defer closeFd(fds[1]);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        defer closeFd(fds[1]);
 
-    const addresses = [_]IpAddress{
-        try ip("93.184.216.34", 443),
-        try ip("93.184.216.35", 443),
-    };
-    const deadline_ms = monotonicMillis() + 10_000;
-    var scripted = ScriptedDialer{
-        .errors = &.{ error.ConnectionRefused, null },
-        .returned_fds = &.{ -1, fds[0] },
-    };
+        const addresses = [_]IpAddress{
+            try ip("93.184.216.34", 443),
+            try ip("93.184.216.35", 443),
+        };
+        const deadline_ms = monotonicMillis() + 10_000;
+        var scripted = ScriptedDialer{
+            .errors = &.{ error.ConnectionRefused, null },
+            .returned_fds = &.{ -1, fds[0] },
+        };
 
-    const fd = try connectAdmitted(&addresses, .{
-        .deadline = .{ .deadline_ms = deadline_ms },
-    }, scripted.dialer());
-    defer closeFd(fd);
+        const fd = try connectAdmitted(&addresses, .{
+            .deadline = .{ .deadline_ms = deadline_ms },
+        }, scripted.dialer());
+        defer closeFd(fd);
 
-    try std.testing.expectEqual(@as(usize, 2), scripted.calls);
-    try std.testing.expect(scripted.attempts[0].eql(&addresses[0]));
-    try std.testing.expect(scripted.attempts[1].eql(&addresses[1]));
-    try std.testing.expectEqual(deadline_ms, scripted.deadlines[0].?);
-    try std.testing.expectEqual(deadline_ms, scripted.deadlines[1].?);
+        try std.testing.expectEqual(@as(usize, 2), scripted.calls);
+        try std.testing.expect(scripted.attempts[0].eql(&addresses[0]));
+        try std.testing.expect(scripted.attempts[1].eql(&addresses[1]));
+        try std.testing.expectEqual(deadline_ms, scripted.deadlines[0].?);
+        try std.testing.expectEqual(deadline_ms, scripted.deadlines[1].?);
+    }
 }
 
 test "web_fetch admitted dialing stops on control and local resource failures" {
-    const addresses = [_]IpAddress{
-        try ip("93.184.216.34", 443),
-        try ip("93.184.216.35", 443),
-    };
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const addresses = [_]IpAddress{
+            try ip("93.184.216.34", 443),
+            try ip("93.184.216.35", 443),
+        };
 
-    var cancel_flag: std.atomic.Value(bool) = .init(false);
-    var canceled = ScriptedDialer{
-        .errors = &.{ error.ConnectionRefused, null },
-        .returned_fds = &.{ -1, -1 },
-        .cancel_after_call = 1,
-        .cancel_flag = &cancel_flag,
-    };
-    try std.testing.expectError(error.Canceled, connectAdmitted(&addresses, .{
-        .cancel_flag = &cancel_flag,
-    }, canceled.dialer()));
-    try std.testing.expectEqual(@as(usize, 1), canceled.calls);
+        var cancel_flag: std.atomic.Value(bool) = .init(false);
+        var canceled = ScriptedDialer{
+            .errors = &.{ error.ConnectionRefused, null },
+            .returned_fds = &.{ -1, -1 },
+            .cancel_after_call = 1,
+            .cancel_flag = &cancel_flag,
+        };
+        try std.testing.expectError(error.Canceled, connectAdmitted(&addresses, .{
+            .cancel_flag = &cancel_flag,
+        }, canceled.dialer()));
+        try std.testing.expectEqual(@as(usize, 1), canceled.calls);
 
-    var resources = ScriptedDialer{
-        .errors = &.{ error.SystemResources, null },
-        .returned_fds = &.{ -1, -1 },
-    };
-    try std.testing.expectError(error.SystemResources, connectAdmitted(
-        &addresses,
-        .{},
-        resources.dialer(),
-    ));
-    try std.testing.expectEqual(@as(usize, 1), resources.calls);
+        var resources = ScriptedDialer{
+            .errors = &.{ error.SystemResources, null },
+            .returned_fds = &.{ -1, -1 },
+        };
+        try std.testing.expectError(error.SystemResources, connectAdmitted(
+            &addresses,
+            .{},
+            resources.dialer(),
+        ));
+        try std.testing.expectEqual(@as(usize, 1), resources.calls);
 
-    var expired = ScriptedDialer{
-        .errors = &.{null},
-        .returned_fds = &.{-1},
-    };
-    try std.testing.expectError(error.Timeout, connectAdmitted(&addresses, .{
-        .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
-    }, expired.dialer()));
-    try std.testing.expectEqual(@as(usize, 0), expired.calls);
+        var expired = ScriptedDialer{
+            .errors = &.{null},
+            .returned_fds = &.{-1},
+        };
+        try std.testing.expectError(error.Timeout, connectAdmitted(&addresses, .{
+            .deadline = .{ .deadline_ms = monotonicMillis() - 1 },
+        }, expired.dialer()));
+        try std.testing.expectEqual(@as(usize, 0), expired.calls);
 
-    var exhausted = ScriptedDialer{
-        .errors = &.{ error.ConnectionRefused, error.HostUnreachable },
-        .returned_fds = &.{ -1, -1 },
-    };
-    try std.testing.expectError(error.HostUnreachable, connectAdmitted(
-        &addresses,
-        .{},
-        exhausted.dialer(),
-    ));
-    try std.testing.expectEqual(@as(usize, 2), exhausted.calls);
+        var exhausted = ScriptedDialer{
+            .errors = &.{ error.ConnectionRefused, error.HostUnreachable },
+            .returned_fds = &.{ -1, -1 },
+        };
+        try std.testing.expectError(error.HostUnreachable, connectAdmitted(
+            &addresses,
+            .{},
+            exhausted.dialer(),
+        ));
+        try std.testing.expectEqual(@as(usize, 2), exhausted.calls);
 
-    try std.testing.expectError(error.NoAddressReturned, connectAdmitted(
-        &.{},
-        .{},
-        exhausted.dialer(),
-    ));
+        try std.testing.expectError(error.NoAddressReturned, connectAdmitted(
+            &.{},
+            .{},
+            exhausted.dialer(),
+        ));
+    }
 }
 
 test "web_fetch connect errno classification keeps terminal local failures out of fallback" {
@@ -3601,7 +3669,7 @@ const ScriptedPoller = struct {
         return .{ .ctx = @ptrCast(self), .poll_fn = poll };
     }
 
-    fn poll(raw: ?*anyopaque, fds: []posix.pollfd, timeout_ms: i32) PollError!usize {
+    fn poll(raw: ?*anyopaque, fds: []Pollfd, timeout_ms: i32) PollError!usize {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         self.calls += 1;
         self.observed_events = fds[0].events;
@@ -3624,64 +3692,68 @@ const ScriptedPoller = struct {
 };
 
 test "web_fetch poll events preserve requested readiness and hangup semantics" {
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.IN | posix.POLL.ERR);
-    try classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.OUT | posix.POLL.HUP);
-    try classifyPollEvents(-1, posix.POLL.IN, posix.POLL.HUP);
-    try std.testing.expectError(
-        error.UnexpectedClose,
-        classifyPollEvents(-1, posix.POLL.OUT, posix.POLL.HUP),
-    );
-    try std.testing.expectError(
-        error.InvalidDescriptor,
-        classifyPollEvents(-1, posix.POLL.IN, posix.POLL.NVAL),
-    );
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        try classifyPollEvents(-1, poll_in, poll_in | poll_hup);
+        try classifyPollEvents(-1, poll_in, poll_in | poll_err);
+        try classifyPollEvents(-1, poll_out, poll_out | poll_hup);
+        try classifyPollEvents(-1, poll_in, poll_hup);
+        try std.testing.expectError(
+            error.UnexpectedClose,
+            classifyPollEvents(-1, poll_out, poll_hup),
+        );
+        try std.testing.expectError(
+            error.InvalidDescriptor,
+            classifyPollEvents(-1, poll_in, poll_nval),
+        );
 
-    var sockets: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
-        return error.SocketPairFailed;
-    defer closeFd(sockets[0]);
-    defer closeFd(sockets[1]);
-    try std.testing.expectError(
-        error.UnexpectedClose,
-        classifyPollEvents(sockets[0], posix.POLL.IN, posix.POLL.ERR),
-    );
+        var sockets: [2]std.c.fd_t = undefined;
+        if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+            return error.SocketPairFailed;
+        defer closeFd(sockets[0]);
+        defer closeFd(sockets[1]);
+        try std.testing.expectError(
+            error.UnexpectedClose,
+            classifyPollEvents(sockets[0], poll_in, poll_err),
+        );
+    }
 }
 
 test "web_fetch injected poll failures and arguments remain exact" {
-    var interrupted = ScriptedPoller{
-        .result = .interrupted_once,
-        .revents = posix.POLL.IN,
-    };
-    try pollFdWith(
-        42,
-        posix.POLL.IN,
-        .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
-        interrupted.poller(),
-    );
-    try std.testing.expectEqual(@as(usize, 2), interrupted.calls);
-    try std.testing.expectEqual(posix.POLL.IN, interrupted.observed_events);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var interrupted = ScriptedPoller{
+            .result = .interrupted_once,
+            .revents = poll_in,
+        };
+        try pollFdWith(
+            42,
+            poll_in,
+            .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
+            interrupted.poller(),
+        );
+        try std.testing.expectEqual(@as(usize, 2), interrupted.calls);
+        try std.testing.expectEqual(poll_in, interrupted.observed_events);
 
-    var resources = ScriptedPoller{ .result = .system_resources };
-    try std.testing.expectError(error.SystemResources, pollFdWith(
-        42,
-        posix.POLL.IN,
-        .{},
-        resources.poller(),
-    ));
-    try std.testing.expectEqual(@as(usize, 1), resources.calls);
-    try std.testing.expectEqual(posix.POLL.IN, resources.observed_events);
-    try std.testing.expectEqual(@as(i32, 1000), resources.observed_timeout_ms);
+        var resources = ScriptedPoller{ .result = .system_resources };
+        try std.testing.expectError(error.SystemResources, pollFdWith(
+            42,
+            poll_in,
+            .{},
+            resources.poller(),
+        ));
+        try std.testing.expectEqual(@as(usize, 1), resources.calls);
+        try std.testing.expectEqual(poll_in, resources.observed_events);
+        try std.testing.expectEqual(@as(i32, 1000), resources.observed_timeout_ms);
 
-    var network_down = ScriptedPoller{ .result = .network_down };
-    try std.testing.expectError(error.NetworkDown, pollFdWith(
-        42,
-        posix.POLL.OUT,
-        .{},
-        network_down.poller(),
-    ));
-    try std.testing.expectEqual(@as(usize, 1), network_down.calls);
-    try std.testing.expectEqual(posix.POLL.OUT, network_down.observed_events);
+        var network_down = ScriptedPoller{ .result = .network_down };
+        try std.testing.expectError(error.NetworkDown, pollFdWith(
+            42,
+            poll_out,
+            .{},
+            network_down.poller(),
+        ));
+        try std.testing.expectEqual(@as(usize, 1), network_down.calls);
+        try std.testing.expectEqual(poll_out, network_down.observed_events);
+    }
 }
 
 fn noOpSignalHandler(_: posix.SIG) callconv(.c) void {}
@@ -3700,43 +3772,45 @@ const PollSignalStorm = struct {
 };
 
 test "web_fetch poll deadline is not extended by interrupted syscalls" {
-    const action: posix.Sigaction = .{
-        .handler = .{ .handler = noOpSignalHandler },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    var old_action: posix.Sigaction = undefined;
-    posix.sigaction(.USR1, &action, &old_action);
-    defer posix.sigaction(.USR1, &old_action, null);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const action: posix.Sigaction = .{
+            .handler = .{ .handler = noOpSignalHandler },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old_action: posix.Sigaction = undefined;
+        posix.sigaction(.USR1, &action, &old_action);
+        defer posix.sigaction(.USR1, &old_action, null);
 
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    defer closeFd(fds[0]);
-    defer closeFd(fds[1]);
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        defer closeFd(fds[0]);
+        defer closeFd(fds[1]);
 
-    const started_ms = monotonicMillis();
-    const deadline_ms = started_ms + 75;
-    var stop: std.atomic.Value(bool) = .init(false);
-    const storm = try std.Thread.spawn(
-        .{},
-        PollSignalStorm.run,
-        .{PollSignalStorm{
-            .target = std.c.pthread_self(),
-            .stop = &stop,
-        }},
-    );
-    defer {
-        stop.store(true, .seq_cst);
-        storm.join();
+        const started_ms = monotonicMillis();
+        const deadline_ms = started_ms + 75;
+        var stop: std.atomic.Value(bool) = .init(false);
+        const storm = try std.Thread.spawn(
+            .{},
+            PollSignalStorm.run,
+            .{PollSignalStorm{
+                .target = std.c.pthread_self(),
+                .stop = &stop,
+            }},
+        );
+        defer {
+            stop.store(true, .seq_cst);
+            storm.join();
+        }
+
+        try std.testing.expectError(error.Timeout, pollFd(
+            fds[0],
+            poll_in,
+            .{ .deadline = .{ .deadline_ms = deadline_ms } },
+        ));
+        const elapsed_ms = monotonicMillis() - started_ms;
+        try std.testing.expect(elapsed_ms < 1000);
     }
-
-    try std.testing.expectError(error.Timeout, pollFd(
-        fds[0],
-        posix.POLL.IN,
-        .{ .deadline = .{ .deadline_ms = deadline_ms } },
-    ));
-    const elapsed_ms = monotonicMillis() - started_ms;
-    try std.testing.expect(elapsed_ms < 1000);
 }
 
 fn expectSyscallFailure(action: SyscallErrorAction, expected: anyerror) !void {
@@ -3793,91 +3867,99 @@ const InterruptingRead = struct {
 };
 
 test "web_fetch interrupted socket read rechecks cancellation before retry" {
-    var cancel_flag: std.atomic.Value(bool) = .init(false);
-    var poller = ScriptedPoller{ .revents = posix.POLL.IN };
-    var read = InterruptingRead{ .cancel_flag = &cancel_flag };
-    var buf: [1]u8 = undefined;
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var cancel_flag: std.atomic.Value(bool) = .init(false);
+        var poller = ScriptedPoller{ .revents = poll_in };
+        var read = InterruptingRead{ .cancel_flag = &cancel_flag };
+        var buf: [1]u8 = undefined;
 
-    try std.testing.expectError(error.Canceled, rawReadWith(
-        42,
-        &buf,
-        .{ .cancel_flag = &cancel_flag },
-        poller.poller(),
-        read.syscall(),
-    ));
-    try std.testing.expectEqual(@as(usize, 1), read.calls);
-    try std.testing.expectEqual(@as(usize, 1), poller.calls);
+        try std.testing.expectError(error.Canceled, rawReadWith(
+            42,
+            &buf,
+            .{ .cancel_flag = &cancel_flag },
+            poller.poller(),
+            read.syscall(),
+        ));
+        try std.testing.expectEqual(@as(usize, 1), read.calls);
+        try std.testing.expectEqual(@as(usize, 1), poller.calls);
+    }
 }
 
 test "web_fetch deadline reader drains bytes after hangup and then returns eof" {
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    defer closeFd(fds[0]);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        defer closeFd(fds[0]);
 
-    const payload = "final bytes";
-    const written = std.c.write(fds[1], payload.ptr, payload.len);
-    if (written < 0) return error.PipeWriteFailed;
-    try std.testing.expectEqual(payload.len, @as(usize, @intCast(written)));
-    closeFd(fds[1]);
+        const payload = "final bytes";
+        const written = std.c.write(fds[1], payload.ptr, payload.len);
+        if (written < 0) return error.PipeWriteFailed;
+        try std.testing.expectEqual(payload.len, @as(usize, @intCast(written)));
+        closeFd(fds[1]);
 
-    var reader: PlainDeadlineReader = undefined;
-    reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
-    var storage: [32]u8 = undefined;
-    var data: [1][]u8 = .{&storage};
-    const count = try reader.interface.vtable.readVec(&reader.interface, &data);
-    try std.testing.expectEqualStrings(payload, storage[0..count]);
+        var reader: PlainDeadlineReader = undefined;
+        reader.init(fds[0], .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } });
+        var storage: [32]u8 = undefined;
+        var data: [1][]u8 = .{&storage};
+        const count = try reader.interface.vtable.readVec(&reader.interface, &data);
+        try std.testing.expectEqualStrings(payload, storage[0..count]);
 
-    try std.testing.expectError(
-        error.EndOfStream,
-        reader.interface.vtable.readVec(&reader.interface, &data),
-    );
-    try std.testing.expect(reader.err == null);
+        try std.testing.expectError(
+            error.EndOfStream,
+            reader.interface.vtable.readVec(&reader.interface, &data),
+        );
+        try std.testing.expect(reader.err == null);
+    }
 }
 
 test "web_fetch deadline adapters retain invalid descriptor causes" {
-    var fds: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&fds) != 0) return error.PipeFailed;
-    closeFd(fds[0]);
-    closeFd(fds[1]);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&fds) != 0) return error.PipeFailed;
+        closeFd(fds[0]);
+        closeFd(fds[1]);
 
-    const options: FetchOptions = .{
-        .deadline = .{ .deadline_ms = monotonicMillis() + 1000 },
-    };
-    var reader: PlainDeadlineReader = undefined;
-    reader.init(fds[0], options);
-    var byte: [1]u8 = undefined;
-    var data: [1][]u8 = .{&byte};
-    try std.testing.expectError(
-        error.ReadFailed,
-        reader.interface.vtable.readVec(&reader.interface, &data),
-    );
-    try std.testing.expectEqual(error.InvalidDescriptor, reader.err.?);
+        const options: FetchOptions = .{
+            .deadline = .{ .deadline_ms = monotonicMillis() + 1000 },
+        };
+        var reader: PlainDeadlineReader = undefined;
+        reader.init(fds[0], options);
+        var byte: [1]u8 = undefined;
+        var data: [1][]u8 = .{&byte};
+        try std.testing.expectError(
+            error.ReadFailed,
+            reader.interface.vtable.readVec(&reader.interface, &data),
+        );
+        try std.testing.expectEqual(error.InvalidDescriptor, reader.err.?);
 
-    var writer: PlainDeadlineWriter = undefined;
-    writer.init(fds[1], options);
-    try writer.interface.writeAll("x");
-    try std.testing.expectError(error.WriteFailed, writer.interface.flush());
-    try std.testing.expectEqual(error.InvalidDescriptor, writer.err.?);
+        var writer: PlainDeadlineWriter = undefined;
+        writer.init(fds[1], options);
+        try writer.interface.writeAll("x");
+        try std.testing.expectError(error.WriteFailed, writer.interface.flush());
+        try std.testing.expectEqual(error.InvalidDescriptor, writer.err.?);
+    }
 }
 
 test "web_fetch closed peer write returns a cause without terminating process" {
-    var sockets: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
-        return error.SocketPairFailed;
-    defer closeFd(sockets[0]);
-    if (std.c.shutdown(sockets[1], posix.SHUT.RDWR) != 0)
-        return error.SocketShutdownFailed;
-    closeFd(sockets[1]);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        var sockets: [2]std.c.fd_t = undefined;
+        if (std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &sockets) != 0)
+            return error.SocketPairFailed;
+        defer closeFd(sockets[0]);
+        if (std.c.shutdown(sockets[1], posix.SHUT.RDWR) != 0)
+            return error.SocketShutdownFailed;
+        closeFd(sockets[1]);
 
-    var poller = ScriptedPoller{ .revents = posix.POLL.OUT | posix.POLL.HUP };
-    rawWriteAllWith(
-        sockets[0],
-        "x",
-        .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
-        poller.poller(),
-    ) catch |err| {
-        try std.testing.expect(err == error.BrokenPipe or err == error.ConnectionResetByPeer);
-        return;
-    };
-    return error.TestExpectedError;
+        var poller = ScriptedPoller{ .revents = poll_out | poll_hup };
+        rawWriteAllWith(
+            sockets[0],
+            "x",
+            .{ .deadline = .{ .deadline_ms = monotonicMillis() + 1000 } },
+            poller.poller(),
+        ) catch |err| {
+            try std.testing.expect(err == error.BrokenPipe or err == error.ConnectionResetByPeer);
+            return;
+        };
+        return error.TestExpectedError;
+    }
 }

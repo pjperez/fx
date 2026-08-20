@@ -3580,7 +3580,7 @@ fn readTraceFileForTest(alloc: Allocator, trace_path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer file.close(io_mod.getIo());
     var read_buf: [1024]u8 = undefined;
-    var reader = file.reader(std.testing.io, &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(64 * 1024));
 }
 
@@ -6107,7 +6107,7 @@ test "run_command timeout returns model-visible failure" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,

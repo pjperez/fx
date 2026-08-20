@@ -115,12 +115,17 @@ fn try_reap_clipboard_process(child: *std.process.Child) error{WaitFailed}!?std.
 }
 
 fn kill_and_wait_clipboard_process(child: *std.process.Child) !std.process.Child.Term {
-    const pid = child.id orelse return error.WaitFailed;
-    std.posix.kill(pid, .KILL) catch |err| switch (err) {
-        error.ProcessNotFound => {},
-        else => |kill_err| return kill_err,
-    };
-    return child.wait(io_mod.getIo());
+    if (comptime builtin.os.tag == .windows) {
+        child.kill(io_mod.getIo());
+        return child.wait(io_mod.getIo());
+    } else {
+        const pid = child.id orelse return error.WaitFailed;
+        std.posix.kill(pid, .KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => |kill_err| return kill_err,
+        };
+        return child.wait(io_mod.getIo());
+    }
 }
 
 fn wait_for_clipboard_process(
@@ -265,6 +270,8 @@ test "native clipboard accepts only a successful exit" {
     try std.testing.expect(copySucceeded(.{ .exited = 0 }));
     try std.testing.expect(!copySucceeded(.{ .exited = 1 }));
     try std.testing.expect(!copySucceeded(.{ .signal = .TERM }));
-    try std.testing.expect(!copySucceeded(.{ .stopped = .STOP }));
+    if (comptime builtin.os.tag != .windows) {
+        try std.testing.expect(!copySucceeded(.{ .stopped = .STOP }));
+    }
     try std.testing.expect(!copySucceeded(.{ .unknown = 1 }));
 }

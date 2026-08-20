@@ -7116,7 +7116,7 @@ test "resume view persistence waits for main frame and retries failed writes" {
     try loaded.log.dir.dir.createDir(
         std.testing.io,
         "resume-view.bin",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     Runtime(TestApp).persistResumeViewAfterFrame(&app);
     try std.testing.expect(loaded.resume_view_stale);
@@ -8697,8 +8697,8 @@ test "combined preference patch writes user defaults cleans legacy fields and ap
     }
     const fixture = try std.fmt.allocPrint(
         alloc,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/model\",\"effort\":\"low\"}}}}}}\n",
-        .{paths.workspace},
+        "{{\"workspaces\":{{{f}:{{\"model\":\"legacy/model\",\"effort\":\"low\"}}}}}}\n",
+        .{std.json.fmt(paths.workspace, .{})},
     );
     defer alloc.free(fixture);
     var settings_file = try tmp.dir.createFile(io_mod.getIo(), "home/.fx/settings.json", .{ .truncate = true });

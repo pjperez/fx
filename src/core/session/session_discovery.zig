@@ -624,7 +624,7 @@ pub fn classifyLegacyCandidate(
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
     if (stat.size > automatic_legacy_max_bytes) return error.LegacySessionTooLarge;
     var buffer: [16 * 1024]u8 = undefined;
-    var reader = file.readerStreaming(io_mod.getIo(), &buffer);
+    var reader = io_mod.fileReader(&file, &buffer);
     var legacy = session_json.parseLegacySummaryStreaming(
         LegacyCandidateSummary,
         alloc,

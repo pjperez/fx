@@ -40,7 +40,7 @@ pub fn readExternalTaskLogTail(alloc: Allocator, log_path: []const u8, max_bytes
     const start = size - tail_size;
 
     var read_buf: [8192]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     if (start > 0) try reader.seekTo(start);
     const read_limit = std.math.add(usize, tail_size, 1) catch tail_size;
     const content = try reader.interface.allocRemaining(alloc, std.Io.Limit.limited(read_limit));
@@ -247,7 +247,7 @@ fn tailLogSlice(content: []const u8, window_start: usize, max_lines: usize) []co
 fn readLogRange(alloc: Allocator, file: *std.Io.File, start: usize, len: usize) ![]u8 {
     if (len == 0) return alloc.dupe(u8, "");
     var read_buf: [8192]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     try reader.seekTo(start);
     const out = try alloc.alloc(u8, len);
     errdefer alloc.free(out);

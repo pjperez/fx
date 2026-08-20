@@ -1056,7 +1056,8 @@ fn emitShutdownCleanupAndResume(shell: *TranscriptRuntime, metrics: *Metrics) vo
 }
 
 pub fn writeLifecycleTerminalBytes(shell: *TranscriptRuntime, metrics: *Metrics, bytes: []const u8) !void {
-    try shell.stdout_file.writeStreamingAll(io_mod.getIo(), bytes);
+    var sink = io_mod.resolveStdFile(shell.stdout_file);
+    try sink.writeStreamingAll(io_mod.getIo(), bytes);
     if (shell.shadow_vt) |grid| {
         grid.feed(bytes) catch |err| debug_trace.logf(
             "render",
@@ -2002,8 +2003,8 @@ test "loadStartupState defaults fast mode off and preserves explicit preferences
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":true}}}}}}\n",
-        .{ configured_root, enabled_root },
+        "{{\"workspaces\":{{{f}:{{\"model\":\"openai/gpt-5\"}},{f}:{{\"fast_mode\":true}}}}}}\n",
+        .{ std.json.fmt(configured_root, .{}), std.json.fmt(enabled_root, .{}) },
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2047,8 +2048,8 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
-        .{disabled_root},
+        "{{\"workspaces\":{{{f}:{{\"startup_scrollback\":false}}}}}}\n",
+        .{std.json.fmt(disabled_root, .{})},
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
@@ -2083,8 +2084,8 @@ test "loadStartupState resolves input appearance default and explicit lines" {
 
     const fixture = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"workspaces\":{{\"{s}\":{{\"input_appearance\":\"lines\"}}}}}}\n",
-        .{lines_root},
+        "{{\"workspaces\":{{{f}:{{\"input_appearance\":\"lines\"}}}}}}\n",
+        .{std.json.fmt(lines_root, .{})},
     );
     defer std.testing.allocator.free(fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);

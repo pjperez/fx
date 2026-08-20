@@ -13,8 +13,8 @@ const max_record_bytes: usize = 256 * 1024;
 const compaction_threshold_bytes: u64 = 1024 * 1024;
 const compaction_record_limit: usize = 1000;
 const compaction_byte_limit: usize = 1024 * 1024;
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = io_mod.permissionsFromMode(0o700);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 
 pub const LoadedPromptHistoryEntry = struct {
     text: []u8,
@@ -137,7 +137,7 @@ pub const Store = struct {
             return .duplicate;
         }
 
-        try file.writePositionalAll(io_mod.getIo(), line, boundary);
+        try io_mod.writePositionalAll(file, line, boundary);
         file.sync(io_mod.getIo()) catch return error.PromptHistoryWriteFailed;
         const committed_length = boundary + line.len;
         if (committed_length <= compaction_threshold_bytes) return .appended;
@@ -238,13 +238,14 @@ pub const Store = struct {
             };
         }
 
-        self.durable_home.?.dir.setPermissions(
+        io_mod.setDirPermissions(
+            self.durable_home.?.dir,
             io_mod.getIo(),
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;
         const stat = try self.durable_home.?.dir.stat(io_mod.getIo());
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        if (stat.permissions.toMode() & 0o777 != 0o700) {
+        if (!io_mod.hasMode(stat.permissions, 0o700)) {
             return error.PrivateStatePermissionsUnsupported;
         }
     }
@@ -300,7 +301,7 @@ pub const Store = struct {
             };
         }
         const verified = if (writable) try file.stat(zio) else initial;
-        if (verified.permissions.toMode() & 0o777 != 0o600) {
+        if (!io_mod.hasMode(verified.permissions, 0o600)) {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (created) {
@@ -322,8 +323,8 @@ pub const Store = struct {
         const length = try file.length(io_mod.getIo());
         if (length > 0) {
             var trailing: [1]u8 = undefined;
-            const count = try file.readPositionalAll(
-                io_mod.getIo(),
+            const count = try io_mod.readPositionalAll(
+                file,
                 &trailing,
                 length - 1,
             );
@@ -393,8 +394,8 @@ pub const Store = struct {
         }
 
         var last: [1]u8 = undefined;
-        const last_count = try file.readPositionalAll(
-            io_mod.getIo(),
+        const last_count = try io_mod.readPositionalAll(
+            file,
             &last,
             boundary - 1,
         );
@@ -418,8 +419,8 @@ pub const Store = struct {
             const block_len: usize = @intCast(block_len_u64);
             const block = try alloc.alloc(u8, block_len);
             defer alloc.free(block);
-            const count = try file.readPositionalAll(
-                io_mod.getIo(),
+            const count = try io_mod.readPositionalAll(
+                file,
                 block,
                 start,
             );
@@ -692,7 +693,7 @@ fn repairIncompleteTail(file: std.Io.File) !void {
     const length = try file.length(io_mod.getIo());
     if (length == 0) return;
     var last: [1]u8 = undefined;
-    const count = try file.readPositionalAll(io_mod.getIo(), &last, length - 1);
+    const count = try io_mod.readPositionalAll(file, &last, length - 1);
     if (count == 1 and last[0] == '\n') return;
 
     var cursor = length;
@@ -700,8 +701,8 @@ fn repairIncompleteTail(file: std.Io.File) !void {
     while (cursor > 0) {
         const start = cursor - @min(cursor, buffer.len);
         const read_len: usize = @intCast(cursor - start);
-        const read_count = try file.readPositionalAll(
-            io_mod.getIo(),
+        const read_count = try io_mod.readPositionalAll(
+            file,
             buffer[0..read_len],
             start,
         );
@@ -733,8 +734,8 @@ fn readLineAt(
             @as(u64, chunk.len),
             max_end - cursor,
         ));
-        const count = try file.readPositionalAll(
-            io_mod.getIo(),
+        const count = try io_mod.readPositionalAll(
+            file,
             chunk[0..limit],
             cursor,
         );
@@ -761,8 +762,8 @@ fn readLineAt(
                     @as(u64, chunk.len),
                     max_end - cursor,
                 ));
-                const skip_count = try file.readPositionalAll(
-                    io_mod.getIo(),
+                const skip_count = try io_mod.readPositionalAll(
+                    file,
                     chunk[0..skip_limit],
                     cursor,
                 );
@@ -880,7 +881,7 @@ fn ensureFixtureHome(home: []const u8) !void {
     std.Io.Dir.createDirAbsolute(
         std.testing.io,
         fx_dir,
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     ) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -893,7 +894,7 @@ fn writeFixture(home: []const u8, bytes: []const u8) !void {
     defer std.testing.allocator.free(path);
     var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromMode(0o600),
     });
     defer file.close(std.testing.io);
     try file.writeStreamingAll(std.testing.io, bytes);
@@ -1363,18 +1364,18 @@ test "first append creates only private prompt history layout and reports layout
     defer fx_dir.close(std.testing.io);
     const fx_stat = try fx_dir.stat(std.testing.io);
     try std.testing.expectEqual(
-        @as(std.posix.mode_t, 0o700),
-        fx_stat.permissions.toMode() & 0o777,
+        @as(io_mod.Mode, 0o700),
+        io_mod.permissionsModeOrZero(fx_stat.permissions),
     );
     const history_stat = try fx_dir.statFile(std.testing.io, "history.jsonl", .{});
     const lock_stat = try fx_dir.statFile(std.testing.io, "history.lock", .{});
     try std.testing.expectEqual(
-        @as(std.posix.mode_t, 0o600),
-        history_stat.permissions.toMode() & 0o777,
+        @as(io_mod.Mode, 0o600),
+        io_mod.permissionsModeOrZero(history_stat.permissions),
     );
     try std.testing.expectEqual(
-        @as(std.posix.mode_t, 0o600),
-        lock_stat.permissions.toMode() & 0o777,
+        @as(io_mod.Mode, 0o600),
+        io_mod.permissionsModeOrZero(lock_stat.permissions),
     );
 
     var failed_tmp = std.testing.tmpDir(.{});

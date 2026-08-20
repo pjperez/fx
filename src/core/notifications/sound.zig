@@ -75,7 +75,7 @@ fn cueFileMatches(path: []const u8, expected: []const u8) bool {
     if (opened_stat.kind != .file or opened_stat.size != expected.len) return false;
 
     var reader_buffer: [4096]u8 = undefined;
-    var reader = file.reader(io, &reader_buffer);
+    var reader = io_mod.fileReader(file, &reader_buffer);
     var chunk: [4096]u8 = undefined;
     var offset: usize = 0;
     while (true) {

@@ -129,6 +129,13 @@ pub fn environment(
     configured_login_shell: ?[]const u8,
     profile: ?Profile,
 ) (ResolveError || Allocator.Error)!Environment {
+    if (comptime builtin.os.tag == .windows) {
+        // Windows runs captured commands through `cmd /C`. There is no login
+        // shell to select, so an explicit profile cannot be honored, and the
+        // absence of one is the only environment the platform offers.
+        if (profile != null) return error.UnsupportedShell;
+        return .legacy;
+    }
     const selected = profile orelse .user;
     const path = try supportedLoginShell(configured_login_shell);
     _ = try resolve(null, switch (selected) {

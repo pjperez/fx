@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const approval_persistence = @import("approval_persistence.zig");
 const authority = @import("authority.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
@@ -9860,7 +9861,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var blocker_present = true;
     defer if (blocker_present) {
@@ -9905,7 +9906,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     blocker_present = true;
     var detach = try domain.validateCommand(alloc, .{ .relationship = .{
@@ -9956,7 +9957,7 @@ test "exact relationship replay repairs a failed resume-index marker" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     blocker_present = true;
     var reparent = try domain.validateCommand(alloc, .{ .relationship = .{
@@ -10005,90 +10006,92 @@ noinline fn resumablePageContains(
 }
 
 test "control queue admission remains available while another process owns session lock" {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent-id");
-    try env.createSession(alloc, "child-id");
-    const session_lock_path = try std.fs.path.join(
-        alloc,
-        &.{ env.store.sessions_dir, "child-id", "session.lock" },
-    );
-    defer alloc.free(session_lock_path);
-    const locker_script =
-        \\import fcntl, os, sys
-        \\lock_file = open(sys.argv[1], "a+b")
-        \\fcntl.flock(lock_file, fcntl.LOCK_EX)
-        \\os.write(1, b"R")
-        \\os.read(0, 1)
-    ;
-    const argv = [_][]const u8{
-        "/usr/bin/env",
-        "python3",
-        "-c",
-        locker_script,
-        session_lock_path,
-    };
-    var locker = try std.process.spawn(io_mod.getIo(), .{
-        .argv = &argv,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-    var locker_reaped = false;
-    defer if (!locker_reaped) {
-        if (locker.stdin) |stdin_file| stdin_file.writeStreamingAll(
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, "parent-id");
+        try env.createSession(alloc, "child-id");
+        const session_lock_path = try std.fs.path.join(
+            alloc,
+            &.{ env.store.sessions_dir, "child-id", "session.lock" },
+        );
+        defer alloc.free(session_lock_path);
+        const locker_script =
+            \\import fcntl, os, sys
+            \\lock_file = open(sys.argv[1], "a+b")
+            \\fcntl.flock(lock_file, fcntl.LOCK_EX)
+            \\os.write(1, b"R")
+            \\os.read(0, 1)
+        ;
+        const argv = [_][]const u8{
+            "/usr/bin/env",
+            "python3",
+            "-c",
+            locker_script,
+            session_lock_path,
+        };
+        var locker = try std.process.spawn(io_mod.getIo(), .{
+            .argv = &argv,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        var locker_reaped = false;
+        defer if (!locker_reaped) {
+            if (locker.stdin) |stdin_file| stdin_file.writeStreamingAll(
+                io_mod.getIo(),
+                "X",
+            ) catch {};
+            _ = locker.wait(io_mod.getIo()) catch {};
+        };
+        var ready: [1]u8 = undefined;
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            try std.posix.read(locker.stdout.?.handle, &ready),
+        );
+        try std.testing.expectEqual(@as(u8, 'R'), ready[0]);
+        const child_session_path = try std.fs.path.join(
+            alloc,
+            &.{ env.store.sessions_dir, "child-id" },
+        );
+        defer alloc.free(child_session_path);
+        const child_session_dir = try std.Io.Dir.openDirAbsolute(
             io_mod.getIo(),
-            "X",
-        ) catch {};
-        _ = locker.wait(io_mod.getIo()) catch {};
-    };
-    var ready: [1]u8 = undefined;
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        try std.posix.read(locker.stdout.?.handle, &ready),
-    );
-    try std.testing.expectEqual(@as(u8, 'R'), ready[0]);
-    const child_session_path = try std.fs.path.join(
-        alloc,
-        &.{ env.store.sessions_dir, "child-id" },
-    );
-    defer alloc.free(child_session_path);
-    const child_session_dir = try std.Io.Dir.openDirAbsolute(
-        io_mod.getIo(),
-        child_session_path,
-        .{ .iterate = true },
-    );
-    var verified_child_dir = io_mod.VerifiedDir{ .dir = child_session_dir };
-    defer verified_child_dir.close();
-    try std.testing.expectError(
-        error.LockBusy,
-        io_mod.acquireTimedAdvisoryLock(&verified_child_dir, "session.lock", 0),
-    );
+            child_session_path,
+            .{ .iterate = true },
+        );
+        var verified_child_dir = io_mod.VerifiedDir{ .dir = child_session_dir };
+        defer verified_child_dir.close();
+        try std.testing.expectError(
+            error.LockBusy,
+            io_mod.acquireTimedAdvisoryLock(&verified_child_dir, "session.lock", 0),
+        );
 
-    var manager = Manager{ .sessions = &env.store };
-    var create = try validateCreate(alloc, "child");
-    defer create.deinit(alloc);
-    var created = try manager.execute(alloc, create, .{
-        .actor_id = "parent-id",
-        .operation_id = "create",
-        .created_child_id = "child-id",
-        .timestamp_ms = 1,
-    });
-    defer created.deinit(alloc);
-    var send = try validateSend(alloc, "child-id", "queued under transcript owner");
-    defer send.deinit(alloc);
-    var result = try manager.execute(alloc, send, .{
-        .actor_id = "parent-id",
-        .operation_id = "send",
-        .timestamp_ms = 2,
-    });
-    defer result.deinit(alloc);
-    try std.testing.expectEqual(domain.OutcomeCode.message_queued, result.receipt.code);
-    try locker.stdin.?.writeStreamingAll(io_mod.getIo(), "X");
-    const term = try locker.wait(io_mod.getIo());
-    locker_reaped = true;
-    try std.testing.expect(term == .exited and term.exited == 0);
+        var manager = Manager{ .sessions = &env.store };
+        var create = try validateCreate(alloc, "child");
+        defer create.deinit(alloc);
+        var created = try manager.execute(alloc, create, .{
+            .actor_id = "parent-id",
+            .operation_id = "create",
+            .created_child_id = "child-id",
+            .timestamp_ms = 1,
+        });
+        defer created.deinit(alloc);
+        var send = try validateSend(alloc, "child-id", "queued under transcript owner");
+        defer send.deinit(alloc);
+        var result = try manager.execute(alloc, send, .{
+            .actor_id = "parent-id",
+            .operation_id = "send",
+            .timestamp_ms = 2,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(domain.OutcomeCode.message_queued, result.receipt.code);
+        try locker.stdin.?.writeStreamingAll(io_mod.getIo(), "X");
+        const term = try locker.wait(io_mod.getIo());
+        locker_reaped = true;
+        try std.testing.expect(term == .exited and term.exited == 0);
+    }
 }
 
 const LockFailureClock = struct { now_ms: i64 = 0 };
@@ -10654,112 +10657,114 @@ test "concurrent control mutations preserve every queued message" {
 }
 
 test "concurrent inverse attaches cannot commit a relationship cycle" {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "root-id");
-    try env.createSession(alloc, "child-a");
-    try env.createSession(alloc, "child-b");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, "root-id");
+        try env.createSession(alloc, "child-a");
+        try env.createSession(alloc, "child-b");
 
-    const Worker = struct {
-        home: []const u8,
-        workspace: []const u8,
-        child_id: []const u8,
-        parent_id: []const u8,
-        operation_id: []const u8,
-        ready: *std.atomic.Value(usize),
-        start: *std.atomic.Value(bool),
-        successes: *std.atomic.Value(usize),
-        cycles: *std.atomic.Value(usize),
-        failed: *std.atomic.Value(bool),
+        const Worker = struct {
+            home: []const u8,
+            workspace: []const u8,
+            child_id: []const u8,
+            parent_id: []const u8,
+            operation_id: []const u8,
+            ready: *std.atomic.Value(usize),
+            start: *std.atomic.Value(bool),
+            successes: *std.atomic.Value(usize),
+            cycles: *std.atomic.Value(usize),
+            failed: *std.atomic.Value(bool),
 
-        fn run(self: @This()) void {
-            const thread_alloc = std.heap.c_allocator;
-            var store = session_store.Store.initFromHome(
-                thread_alloc,
-                self.home,
-                self.workspace,
-            ) catch {
-                self.failed.store(true, .seq_cst);
-                return;
-            };
-            defer store.deinit(thread_alloc);
-            var command = domain.validateCommand(thread_alloc, .{ .relationship = .{
-                .action = .attach,
-                .id = self.child_id,
-                .parent_id = self.parent_id,
-            } }) catch {
-                self.failed.store(true, .seq_cst);
-                return;
-            };
-            defer command.deinit(thread_alloc);
-            _ = self.ready.fetchAdd(1, .seq_cst);
-            while (!self.start.load(.seq_cst)) std.atomic.spinLoopHint();
-            var manager = Manager{ .sessions = &store };
-            var result = manager.execute(thread_alloc, command, .{
-                .actor_id = "root-id",
-                .operation_id = self.operation_id,
-                .relationship_authorization = .direct,
-                .timestamp_ms = 1,
-            }) catch {
-                self.failed.store(true, .seq_cst);
-                return;
-            };
-            defer result.deinit(thread_alloc);
-            switch (result) {
-                .receipt => |receipt| if (receipt.code == .relationship_changed) {
-                    _ = self.successes.fetchAdd(1, .seq_cst);
-                } else self.failed.store(true, .seq_cst),
-                .failure => |failure_value| if (failure_value.code == .relationship_cycle) {
-                    _ = self.cycles.fetchAdd(1, .seq_cst);
-                } else self.failed.store(true, .seq_cst),
-                .inspection => self.failed.store(true, .seq_cst),
+            fn run(self: @This()) void {
+                const thread_alloc = std.heap.c_allocator;
+                var store = session_store.Store.initFromHome(
+                    thread_alloc,
+                    self.home,
+                    self.workspace,
+                ) catch {
+                    self.failed.store(true, .seq_cst);
+                    return;
+                };
+                defer store.deinit(thread_alloc);
+                var command = domain.validateCommand(thread_alloc, .{ .relationship = .{
+                    .action = .attach,
+                    .id = self.child_id,
+                    .parent_id = self.parent_id,
+                } }) catch {
+                    self.failed.store(true, .seq_cst);
+                    return;
+                };
+                defer command.deinit(thread_alloc);
+                _ = self.ready.fetchAdd(1, .seq_cst);
+                while (!self.start.load(.seq_cst)) std.atomic.spinLoopHint();
+                var manager = Manager{ .sessions = &store };
+                var result = manager.execute(thread_alloc, command, .{
+                    .actor_id = "root-id",
+                    .operation_id = self.operation_id,
+                    .relationship_authorization = .direct,
+                    .timestamp_ms = 1,
+                }) catch {
+                    self.failed.store(true, .seq_cst);
+                    return;
+                };
+                defer result.deinit(thread_alloc);
+                switch (result) {
+                    .receipt => |receipt| if (receipt.code == .relationship_changed) {
+                        _ = self.successes.fetchAdd(1, .seq_cst);
+                    } else self.failed.store(true, .seq_cst),
+                    .failure => |failure_value| if (failure_value.code == .relationship_cycle) {
+                        _ = self.cycles.fetchAdd(1, .seq_cst);
+                    } else self.failed.store(true, .seq_cst),
+                    .inspection => self.failed.store(true, .seq_cst),
+                }
             }
+        };
+
+        var ready = std.atomic.Value(usize).init(0);
+        var start = std.atomic.Value(bool).init(false);
+        var successes = std.atomic.Value(usize).init(0);
+        var cycles = std.atomic.Value(usize).init(0);
+        var failed = std.atomic.Value(bool).init(false);
+        const workers = [_]Worker{
+            .{
+                .home = env.home,
+                .workspace = env.workspace,
+                .child_id = "child-a",
+                .parent_id = "child-b",
+                .operation_id = "attach-a",
+                .ready = &ready,
+                .start = &start,
+                .successes = &successes,
+                .cycles = &cycles,
+                .failed = &failed,
+            },
+            .{
+                .home = env.home,
+                .workspace = env.workspace,
+                .child_id = "child-b",
+                .parent_id = "child-a",
+                .operation_id = "attach-b",
+                .ready = &ready,
+                .start = &start,
+                .successes = &successes,
+                .cycles = &cycles,
+                .failed = &failed,
+            },
+        };
+        var threads: [workers.len]std.Thread = undefined;
+        for (&threads, workers) |*thread, worker| {
+            thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
         }
-    };
+        while (ready.load(.seq_cst) != workers.len) std.atomic.spinLoopHint();
+        start.store(true, .seq_cst);
+        for (threads) |thread| thread.join();
 
-    var ready = std.atomic.Value(usize).init(0);
-    var start = std.atomic.Value(bool).init(false);
-    var successes = std.atomic.Value(usize).init(0);
-    var cycles = std.atomic.Value(usize).init(0);
-    var failed = std.atomic.Value(bool).init(false);
-    const workers = [_]Worker{
-        .{
-            .home = env.home,
-            .workspace = env.workspace,
-            .child_id = "child-a",
-            .parent_id = "child-b",
-            .operation_id = "attach-a",
-            .ready = &ready,
-            .start = &start,
-            .successes = &successes,
-            .cycles = &cycles,
-            .failed = &failed,
-        },
-        .{
-            .home = env.home,
-            .workspace = env.workspace,
-            .child_id = "child-b",
-            .parent_id = "child-a",
-            .operation_id = "attach-b",
-            .ready = &ready,
-            .start = &start,
-            .successes = &successes,
-            .cycles = &cycles,
-            .failed = &failed,
-        },
-    };
-    var threads: [workers.len]std.Thread = undefined;
-    for (&threads, workers) |*thread, worker| {
-        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        try std.testing.expect(!failed.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 1), successes.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 1), cycles.load(.seq_cst));
     }
-    while (ready.load(.seq_cst) != workers.len) std.atomic.spinLoopHint();
-    start.store(true, .seq_cst);
-    for (threads) |thread| thread.join();
-
-    try std.testing.expect(!failed.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), successes.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 1), cycles.load(.seq_cst));
 }
 
 const ProcessMutation = union(enum) {
@@ -11035,31 +11040,38 @@ fn forkProcessMutation(
     start_fd: std.c.fd_t,
     status_fd: ?std.c.fd_t,
 ) !std.c.pid_t {
-    const pid = std.c.fork();
-    if (pid < 0) return error.ProcessForkFailed;
-    if (pid != 0) return pid;
+    // `fork` is POSIX-only; the tests using this helper are skipped on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ProcessForkFailed else {
+        const pid = std.c.fork();
+        if (pid < 0) return error.ProcessForkFailed;
+        if (pid != 0) return pid;
 
-    writeExactProcessFd(ready_fd, &.{1}) catch std.c._exit(100);
-    var start: [1]u8 = undefined;
-    readExactProcessFd(start_fd, &start) catch std.c._exit(101);
-    const outcome = runProcessMutation(home, workspace, mutation);
-    if (status_fd) |fd| writeExactProcessFd(fd, &.{outcome}) catch std.c._exit(102);
-    std.c._exit(outcome);
+        writeExactProcessFd(ready_fd, &.{1}) catch std.c._exit(100);
+        var start: [1]u8 = undefined;
+        readExactProcessFd(start_fd, &start) catch std.c._exit(101);
+        const outcome = runProcessMutation(home, workspace, mutation);
+        if (status_fd) |fd| writeExactProcessFd(fd, &.{outcome}) catch std.c._exit(102);
+        std.c._exit(outcome);
+    }
 }
 
 fn waitProcessMutation(pid: std.c.pid_t) !u8 {
-    var status: c_int = 0;
-    while (true) {
-        const waited = std.c.waitpid(pid, &status, 0);
-        switch (std.c.errno(waited)) {
-            .SUCCESS => {
-                if (waited != pid or (status & 0x7f) != 0) {
-                    return error.ProcessWaitFailed;
-                }
-                return @intCast((status >> 8) & 0xff);
-            },
-            .INTR => continue,
-            else => return error.ProcessWaitFailed,
+    // Reaping a child by pid is POSIX-only; the tests using this helper are
+    // skipped on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ProcessWaitFailed else {
+        var status: c_int = 0;
+        while (true) {
+            const waited = std.c.waitpid(pid, &status, 0);
+            switch (std.c.errno(waited)) {
+                .SUCCESS => {
+                    if (waited != pid or (status & 0x7f) != 0) {
+                        return error.ProcessWaitFailed;
+                    }
+                    return @intCast((status >> 8) & 0xff);
+                },
+                .INTR => continue,
+                else => return error.ProcessWaitFailed,
+            }
         }
     }
 }
@@ -11075,152 +11087,160 @@ fn runProcessMutationPair(
     first: ProcessMutation,
     second: ProcessMutation,
 ) ![2]u8 {
-    var ready_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeProcessFd(ready_pipe[0]);
-    defer closeProcessFd(ready_pipe[1]);
-    var start_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&start_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeProcessFd(start_pipe[0]);
-    defer closeProcessFd(start_pipe[1]);
+    // Anonymous pipes are POSIX-only; the tests using this helper are skipped
+    // on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ProcessPipeFailed else {
+        var ready_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeProcessFd(ready_pipe[0]);
+        defer closeProcessFd(ready_pipe[1]);
+        var start_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&start_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeProcessFd(start_pipe[0]);
+        defer closeProcessFd(start_pipe[1]);
 
-    const first_pid = try forkProcessMutation(
-        home,
-        workspace,
-        first,
-        ready_pipe[1],
-        start_pipe[0],
-        null,
-    );
-    const second_pid = forkProcessMutation(
-        home,
-        workspace,
-        second,
-        ready_pipe[1],
-        start_pipe[0],
-        null,
-    ) catch |err| {
-        writeExactProcessFd(start_pipe[1], &.{1}) catch {};
-        _ = waitProcessMutation(first_pid) catch {};
-        return err;
-    };
-    var ready: [2]u8 = undefined;
-    try readExactProcessFd(ready_pipe[0], &ready);
-    try writeExactProcessFd(start_pipe[1], &.{ 1, 1 });
-    return .{
-        try waitProcessMutation(first_pid),
-        try waitProcessMutation(second_pid),
-    };
+        const first_pid = try forkProcessMutation(
+            home,
+            workspace,
+            first,
+            ready_pipe[1],
+            start_pipe[0],
+            null,
+        );
+        const second_pid = forkProcessMutation(
+            home,
+            workspace,
+            second,
+            ready_pipe[1],
+            start_pipe[0],
+            null,
+        ) catch |err| {
+            writeExactProcessFd(start_pipe[1], &.{1}) catch {};
+            _ = waitProcessMutation(first_pid) catch {};
+            return err;
+        };
+        var ready: [2]u8 = undefined;
+        try readExactProcessFd(ready_pipe[0], &ready);
+        try writeExactProcessFd(start_pipe[1], &.{ 1, 1 });
+        return .{
+            try waitProcessMutation(first_pid),
+            try waitProcessMutation(second_pid),
+        };
+    }
 }
 
 test "competing processes converge while recovering one pending relationship transaction" {
-    if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "recovery-root");
-    try env.createSession(alloc, "recovery-child");
-    var manager = Manager{ .sessions = &env.store };
-    try executeRelationshipForTest(
-        alloc,
-        &manager,
-        "recovery-root",
-        "recovery-attach",
-        .attach,
-        "recovery-child",
-        "recovery-root",
-    );
-    try std.testing.expect(try relationship_index.removeChild(
-        alloc,
-        &env.store,
-        "recovery-root",
-        "recovery-child",
-        .{},
-    ));
-    var sync_failure = FailSyncFileAt{ .fail_at = 2 };
-    try std.testing.expectError(
-        error.StoreUnavailable,
-        relationship_index.ensureChild(
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, "recovery-root");
+        try env.createSession(alloc, "recovery-child");
+        var manager = Manager{ .sessions = &env.store };
+        try executeRelationshipForTest(
+            alloc,
+            &manager,
+            "recovery-root",
+            "recovery-attach",
+            .attach,
+            "recovery-child",
+            "recovery-root",
+        );
+        try std.testing.expect(try relationship_index.removeChild(
             alloc,
             &env.store,
             "recovery-root",
             "recovery-child",
-            .{ .replace_ops = .{
-                .ctx = &sync_failure,
-                .sync_file = FailSyncFileAt.syncFile,
-            } },
-        ),
-    );
+            .{},
+        ));
+        var sync_failure = FailSyncFileAt{ .fail_at = 2 };
+        try std.testing.expectError(
+            error.StoreUnavailable,
+            relationship_index.ensureChild(
+                alloc,
+                &env.store,
+                "recovery-root",
+                "recovery-child",
+                .{ .replace_ops = .{
+                    .ctx = &sync_failure,
+                    .sync_file = FailSyncFileAt.syncFile,
+                } },
+            ),
+        );
 
-    var outcomes = try runProcessMutationPair(
-        env.home,
-        env.workspace,
-        .{ .relationship_snapshot = .{ .root_id = "recovery-root" } },
-        .{ .relationship_snapshot = .{ .root_id = "recovery-root" } },
-    );
-    std.mem.sort(u8, &outcomes, {}, std.sort.asc(u8));
-    try std.testing.expectEqualSlices(u8, &.{
-        @intFromEnum(ProcessDeliveryOutcome.relationship_present),
-        @intFromEnum(ProcessDeliveryOutcome.relationship_present),
-    }, &outcomes);
+        var outcomes = try runProcessMutationPair(
+            env.home,
+            env.workspace,
+            .{ .relationship_snapshot = .{ .root_id = "recovery-root" } },
+            .{ .relationship_snapshot = .{ .root_id = "recovery-root" } },
+        );
+        std.mem.sort(u8, &outcomes, {}, std.sort.asc(u8));
+        try std.testing.expectEqualSlices(u8, &.{
+            @intFromEnum(ProcessDeliveryOutcome.relationship_present),
+            @intFromEnum(ProcessDeliveryOutcome.relationship_present),
+        }, &outcomes);
 
-    var page = try relationship_index.page(
-        alloc,
-        &env.store,
-        "recovery-root",
-        .{},
-        null,
-        10,
-        relationship_index.max_candidate_reads,
-    );
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), page.candidates.len);
-    try std.testing.expectEqualStrings(
-        "recovery-child",
-        page.candidates[0].child_id,
-    );
+        var page = try relationship_index.page(
+            alloc,
+            &env.store,
+            "recovery-root",
+            .{},
+            null,
+            10,
+            relationship_index.max_candidate_reads,
+        );
+        defer page.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), page.candidates.len);
+        try std.testing.expectEqualStrings(
+            "recovery-child",
+            page.candidates[0].child_id,
+        );
+    }
 }
 
 test "competing process interval polls append one durable delivery" {
-    if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try setupRunningIntervalWork(alloc, &env, "process-poll-child", "process-work");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
+        const alloc = std.testing.allocator;
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try setupRunningIntervalWork(alloc, &env, "process-poll-child", "process-work");
 
-    var outcomes = try runProcessMutationPair(
-        env.home,
-        env.workspace,
-        .{ .interval_poll = .{
-            .child_id = "process-poll-child",
-            .work_id = "process-work",
-            .now_ms = 100,
-        } },
-        .{ .interval_poll = .{
-            .child_id = "process-poll-child",
-            .work_id = "process-work",
-            .now_ms = 100,
-        } },
-    );
-    std.mem.sort(u8, &outcomes, {}, std.sort.asc(u8));
-    try std.testing.expectEqualSlices(u8, &.{
-        @intFromEnum(ProcessDeliveryOutcome.interval_emitted),
-        @intFromEnum(ProcessDeliveryOutcome.interval_pending),
-    }, &outcomes);
+        var outcomes = try runProcessMutationPair(
+            env.home,
+            env.workspace,
+            .{ .interval_poll = .{
+                .child_id = "process-poll-child",
+                .work_id = "process-work",
+                .now_ms = 100,
+            } },
+            .{ .interval_poll = .{
+                .child_id = "process-poll-child",
+                .work_id = "process-work",
+                .now_ms = 100,
+            } },
+        );
+        std.mem.sort(u8, &outcomes, {}, std.sort.asc(u8));
+        try std.testing.expectEqualSlices(u8, &.{
+            @intFromEnum(ProcessDeliveryOutcome.interval_emitted),
+            @intFromEnum(ProcessDeliveryOutcome.interval_pending),
+        }, &outcomes);
 
-    var communication_manager = communication_manager_mod.Manager{
-        .sessions = &env.store,
-    };
-    var page = try communication_manager.page(
-        alloc,
-        "process-poll-child",
-        "process-human",
-        "interval-parent",
-        null,
-        10,
-    );
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), page.deliveries.len);
+        var communication_manager = communication_manager_mod.Manager{
+            .sessions = &env.store,
+        };
+        var page = try communication_manager.page(
+            alloc,
+            "process-poll-child",
+            "process-human",
+            "interval-parent",
+            null,
+            10,
+        );
+        defer page.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), page.deliveries.len);
+    }
 }
 
 test "competing process policy admissions cannot cross the capacity budget" {
@@ -11294,83 +11314,87 @@ fn runProcessDeliveryRace(
     boundary: bool,
     action: ProcessDeliveryRaceAction,
 ) !ProcessDeliveryOutcome {
-    var ready_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeProcessFd(ready_pipe[0]);
-    defer closeProcessFd(ready_pipe[1]);
-    var start_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&start_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeProcessFd(start_pipe[0]);
-    defer closeProcessFd(start_pipe[1]);
-    var status_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&status_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeProcessFd(status_pipe[0]);
-    defer closeProcessFd(status_pipe[1]);
+    // Anonymous pipes are POSIX-only; the tests using this helper are skipped
+    // on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ProcessPipeFailed else {
+        var ready_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeProcessFd(ready_pipe[0]);
+        defer closeProcessFd(ready_pipe[1]);
+        var start_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&start_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeProcessFd(start_pipe[0]);
+        defer closeProcessFd(start_pipe[1]);
+        var status_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&status_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeProcessFd(status_pipe[0]);
+        defer closeProcessFd(status_pipe[1]);
 
-    const force_lock_busy = switch (action) {
-        .hold_until_busy => true,
-        .reparent, .detach => false,
-    };
+        const force_lock_busy = switch (action) {
+            .hold_until_busy => true,
+            .reparent, .detach => false,
+        };
 
-    const pid = try forkProcessMutation(
-        home,
-        workspace,
-        .{ .delivery_query = .{
-            .owner_id = child_id,
-            .target_id = old_parent_id,
-            .boundary = boundary,
-            .status_fd = status_pipe[1],
-            .force_lock_busy = force_lock_busy,
-        } },
-        ready_pipe[1],
-        start_pipe[0],
-        status_pipe[1],
-    );
-    errdefer {
-        writeExactProcessFd(start_pipe[1], &.{1}) catch {};
-        _ = waitProcessMutation(pid) catch {};
-    }
-    var ready: [1]u8 = undefined;
-    try readExactProcessFd(ready_pipe[0], &ready);
+        const pid = try forkProcessMutation(
+            home,
+            workspace,
+            .{ .delivery_query = .{
+                .owner_id = child_id,
+                .target_id = old_parent_id,
+                .boundary = boundary,
+                .status_fd = status_pipe[1],
+                .force_lock_busy = force_lock_busy,
+            } },
+            ready_pipe[1],
+            start_pipe[0],
+            status_pipe[1],
+        );
+        errdefer {
+            writeExactProcessFd(start_pipe[1], &.{1}) catch {};
+            _ = waitProcessMutation(pid) catch {};
+        }
+        var ready: [1]u8 = undefined;
+        try readExactProcessFd(ready_pipe[0], &ready);
 
-    var capability = try sessions.openSubagentControlCapabilityWritable(
-        alloc,
-        child_id,
-        .{},
-    );
-    defer capability.deinit();
-    const control = control_store.Store{
-        .capability = &capability,
-        .expected_child_id = child_id,
-    };
-    var lock = try control.acquireLock();
-    var lock_held = true;
-    defer if (lock_held) lock.release();
-    try writeExactProcessFd(start_pipe[1], &.{1});
+        var capability = try sessions.openSubagentControlCapabilityWritable(
+            alloc,
+            child_id,
+            .{},
+        );
+        defer capability.deinit();
+        const control = control_store.Store{
+            .capability = &capability,
+            .expected_child_id = child_id,
+        };
+        var lock = try control.acquireLock();
+        var lock_held = true;
+        defer if (lock_held) lock.release();
+        try writeExactProcessFd(start_pipe[1], &.{1});
 
-    var status: [1]u8 = undefined;
-    try readExactProcessFd(status_pipe[0], &status);
-    if (status[0] != process_lock_contended) {
-        const exit_code = try waitProcessMutation(pid);
-        if (exit_code != status[0]) return error.ProcessWaitFailed;
-        return processDeliveryOutcome(exit_code);
-    }
-    if (force_lock_busy) {
+        var status: [1]u8 = undefined;
+        try readExactProcessFd(status_pipe[0], &status);
+        if (status[0] != process_lock_contended) {
+            const exit_code = try waitProcessMutation(pid);
+            if (exit_code != status[0]) return error.ProcessWaitFailed;
+            return processDeliveryOutcome(exit_code);
+        }
+        if (force_lock_busy) {
+            return processDeliveryOutcome(try waitProcessMutation(pid));
+        }
+
+        var record = try control.load(alloc);
+        defer record.deinit(alloc);
+        alloc.free(record.parent_id.?);
+        record.parent_id = switch (action) {
+            .reparent => |parent_id| try alloc.dupe(u8, parent_id),
+            .detach => null,
+            .hold_until_busy => unreachable,
+        };
+        try control.save(alloc, record);
+        lock.release();
+        lock_held = false;
         return processDeliveryOutcome(try waitProcessMutation(pid));
     }
-
-    var record = try control.load(alloc);
-    defer record.deinit(alloc);
-    alloc.free(record.parent_id.?);
-    record.parent_id = switch (action) {
-        .reparent => |parent_id| try alloc.dupe(u8, parent_id),
-        .detach => null,
-        .hold_until_busy => unreachable,
-    };
-    try control.save(alloc, record);
-    lock.release();
-    lock_held = false;
-    return processDeliveryOutcome(try waitProcessMutation(pid));
 }
 
 fn expectProcessDeliveryRaceLost(outcome: ProcessDeliveryOutcome) !void {

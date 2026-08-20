@@ -743,7 +743,7 @@ fn connectAndHandshakeOnce(
     process_provider: background_process_provider.Provider,
 ) !Connected {
     if (!host.isSupported()) return error.TerminalHostUnsupported;
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var paths = try host.Paths.open(alloc, home);
     defer paths.deinit(alloc);
 
@@ -1290,109 +1290,111 @@ test "lazy runtime has no allocation or worker before first admission" {
 }
 
 test "stalled request cancellation emits only the targeted cancel" {
-    if (!host.isSupported()) return error.SkipZigTest;
-    var handles: [2]std.c.fd_t = undefined;
-    if (std.c.socketpair(
-        std.c.AF.UNIX,
-        std.c.SOCK.STREAM,
-        0,
-        &handles,
-    ) != 0) return error.SocketPairFailed;
-    var client_stream = std.Io.net.Stream{ .socket = .{
-        .handle = handles[0],
-        .address = undefined,
-    } };
-    defer client_stream.close(io_mod.getIo());
-    var host_stream = std.Io.net.Stream{ .socket = .{
-        .handle = handles[1],
-        .address = undefined,
-    } };
-    defer host_stream.close(io_mod.getIo());
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        if (!host.isSupported()) return error.SkipZigTest;
+        var handles: [2]std.c.fd_t = undefined;
+        if (std.c.socketpair(
+            std.c.AF.UNIX,
+            std.c.SOCK.STREAM,
+            0,
+            &handles,
+        ) != 0) return error.SocketPairFailed;
+        var client_stream = std.Io.net.Stream{ .socket = .{
+            .handle = handles[0],
+            .address = undefined,
+        } };
+        defer client_stream.close(io_mod.getIo());
+        var host_stream = std.Io.net.Stream{ .socket = .{
+            .handle = handles[1],
+            .address = undefined,
+        } };
+        defer host_stream.close(io_mod.getIo());
 
-    var runtime: Runtime = .{ .alloc = std.testing.allocator };
-    defer runtime.deinit();
-    var worker = RequestWorker{
-        .runtime = &runtime,
-        .intent = .{
-            .correlation_id = .{ .value = 17 },
-            .request = try contracts.OwnedActionRequest.init(
-                std.testing.allocator,
-                .{ .screen = .{ .session_id = "terminal-1" } },
-            ),
-        },
-    };
-    const zio = io_mod.getIo();
-    runtime.mutex.lockUncancelable(zio);
-    try runtime.live_correlations.add(.{ .value = 17 });
-    worker.slot = runtime.registerWorkerLocked(&worker).?;
-    runtime.mutex.unlock(zio);
+        var runtime: Runtime = .{ .alloc = std.testing.allocator };
+        defer runtime.deinit();
+        var worker = RequestWorker{
+            .runtime = &runtime,
+            .intent = .{
+                .correlation_id = .{ .value = 17 },
+                .request = try contracts.OwnedActionRequest.init(
+                    std.testing.allocator,
+                    .{ .screen = .{ .session_id = "terminal-1" } },
+                ),
+            },
+        };
+        const zio = io_mod.getIo();
+        runtime.mutex.lockUncancelable(zio);
+        try runtime.live_correlations.add(.{ .value = 17 });
+        worker.slot = runtime.registerWorkerLocked(&worker).?;
+        runtime.mutex.unlock(zio);
 
-    const Exchange = struct {
-        worker: *RequestWorker,
-        stream: std.Io.net.Stream,
-        completion: ?Completion = null,
-        failed: bool = false,
+        const Exchange = struct {
+            worker: *RequestWorker,
+            stream: std.Io.net.Stream,
+            completion: ?Completion = null,
+            failed: bool = false,
 
-        fn run(self: *@This()) void {
-            self.completion = exchangeConnected(
-                self.worker,
-                std.testing.allocator,
-                &self.worker.intent,
-                .{
-                    .stream = self.stream,
-                    .negotiated = .{
-                        .revision = contracts.current_protocol_revision,
-                        .capabilities = contracts.known_protocol_capabilities,
+            fn run(self: *@This()) void {
+                self.completion = exchangeConnected(
+                    self.worker,
+                    std.testing.allocator,
+                    &self.worker.intent,
+                    .{
+                        .stream = self.stream,
+                        .negotiated = .{
+                            .revision = contracts.current_protocol_revision,
+                            .capabilities = contracts.known_protocol_capabilities,
+                        },
                     },
-                },
-            ) catch {
-                self.failed = true;
-                return;
-            };
+                ) catch {
+                    self.failed = true;
+                    return;
+                };
+            }
+        };
+        var exchange_state = Exchange{
+            .worker = &worker,
+            .stream = client_stream,
+        };
+        const thread = try std.Thread.spawn(.{}, Exchange.run, .{&exchange_state});
+
+        var host_read_buffer: [4096]u8 = undefined;
+        var host_reader = host_stream.reader(io_mod.getIo(), &host_read_buffer);
+        var request = try protocol.readFrame(
+            std.testing.allocator,
+            &host_reader.interface,
+        );
+        defer request.deinit();
+        try std.testing.expectEqual(
+            @as(u64, 17),
+            request.message().envelope.correlation_id.?.value,
+        );
+        try std.testing.expect(runtime.cancel(.{ .value = 17 }));
+        var cancel = try protocol.readFrame(
+            std.testing.allocator,
+            &host_reader.interface,
+        );
+        defer cancel.deinit();
+        try std.testing.expectEqual(
+            @as(u64, 17),
+            cancel.message().envelope.correlation_id.?.value,
+        );
+        switch (cancel.message().payload) {
+            .cancel => {},
+            else => return error.TestExpectedCancel,
         }
-    };
-    var exchange_state = Exchange{
-        .worker = &worker,
-        .stream = client_stream,
-    };
-    const thread = try std.Thread.spawn(.{}, Exchange.run, .{&exchange_state});
 
-    var host_read_buffer: [4096]u8 = undefined;
-    var host_reader = host_stream.reader(io_mod.getIo(), &host_read_buffer);
-    var request = try protocol.readFrame(
-        std.testing.allocator,
-        &host_reader.interface,
-    );
-    defer request.deinit();
-    try std.testing.expectEqual(
-        @as(u64, 17),
-        request.message().envelope.correlation_id.?.value,
-    );
-    try std.testing.expect(runtime.cancel(.{ .value = 17 }));
-    var cancel = try protocol.readFrame(
-        std.testing.allocator,
-        &host_reader.interface,
-    );
-    defer cancel.deinit();
-    try std.testing.expectEqual(
-        @as(u64, 17),
-        cancel.message().envelope.correlation_id.?.value,
-    );
-    switch (cancel.message().payload) {
-        .cancel => {},
-        else => return error.TestExpectedCancel,
+        thread.join();
+        try std.testing.expect(!exchange_state.failed);
+        var completion = exchange_state.completion.?;
+        defer completion.deinit();
+        try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
+        runtime.finishActive(&worker, .{
+            .kind = .cancelled,
+            .correlation_id = .{ .value = 17 },
+        });
+        worker.intent.deinit(std.testing.allocator);
     }
-
-    thread.join();
-    try std.testing.expect(!exchange_state.failed);
-    var completion = exchange_state.completion.?;
-    defer completion.deinit();
-    try std.testing.expectEqual(CompletionKind.cancelled, completion.kind);
-    runtime.finishActive(&worker, .{
-        .kind = .cancelled,
-        .correlation_id = .{ .value = 17 },
-    });
-    worker.intent.deinit(std.testing.allocator);
 }
 
 test "unsupported client platforms remain structural" {

@@ -101,8 +101,11 @@ const terminal_direct_runtime = @import("core/terminal/direct_runtime.zig");
 const app_terminal_runtime = @import("core/app/app_terminal_runtime.zig");
 const app_terminal_takeover_runtime = @import("core/app/app_terminal_takeover_runtime.zig");
 const terminal_host = @import("core/terminal/host.zig");
-const terminal_native_session = @import("core/terminal/native_session.zig");
-const terminal_tmux_session = @import("core/terminal/tmux_session.zig");
+// Terminal hosting drives a pty and a POSIX process group, so these modules
+// exist only where that is possible.
+const terminal_host_supported = terminal_host.isSupported();
+const terminal_native_session = if (terminal_host_supported) @import("core/terminal/native_session.zig") else struct {};
+const terminal_tmux_session = if (terminal_host_supported) @import("core/terminal/tmux_session.zig") else struct {};
 const session_runtime = @import("core/session/session.zig");
 const session_codec = @import("core/session/session_codec.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
@@ -2745,6 +2748,10 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
 
+    // Windows consoles do not interpret ANSI until asked to, and fx renders
+    // nothing else.
+    io_mod.prepareConsole();
+
     if (comptime terminal_host.isSupported()) {
         if (terminal_tmux_session.isCaptureModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
@@ -2923,10 +2930,20 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 }
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
+    if (comptime builtin.os.tag == .windows) {
+        // Windows carries the command line in the PEB as WTF-16 rather than in
+        // the libc `argv` vector.
+        return .{ .vector = std.os.windows.peb().ProcessParameters.CommandLine.slice() };
+    }
     return .{ .vector = raw_args };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
+    if (comptime builtin.os.tag == .windows) {
+        // The Windows environment block lives in the PEB and moves whenever the
+        // environment is modified, so it is always addressed globally.
+        return .global;
+    }
     var count: usize = 0;
     while (raw_env[count] != null) : (count += 1) {}
     return .{ .slice = raw_env[0..count :null] };
@@ -2982,12 +2999,17 @@ fn topLevelHelpStyleForValues(is_terminal: bool, no_color: bool, dumb_terminal: 
 }
 
 fn stdoutIsTerminal() bool {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return false;
+    if (comptime builtin.os.tag == .windows) return io_mod.isTty(io_mod.stdoutHandle());
+    if (comptime !builtin.link_libc) return false;
     return std.c.isatty(std.posix.STDOUT_FILENO) != 0;
 }
 
 fn stdoutTerminalColumns() ?usize {
-    if (comptime builtin.os.tag == .windows or !builtin.link_libc) return null;
+    if (comptime builtin.os.tag == .windows) {
+        const size = io_mod.consoleWindowSize(io_mod.stdoutHandle()) orelse return null;
+        return size.cols;
+    }
+    if (comptime !builtin.link_libc) return null;
 
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const req: c_int = @intCast(std.c.T.IOCGWINSZ);
@@ -3325,7 +3347,7 @@ test "session reset traces and clears active paste state" {
     defer debug_trace.resetForTest();
     try debug_trace.configureForTestWithScopes(alloc, trace_path, "input");
 
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -3382,7 +3404,7 @@ test "terminal help styling respects terminal capability and color opt-outs" {
 }
 
 test "follow up prompt card top margin is renderer-owned" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -3418,7 +3440,7 @@ test "follow up prompt card top margin is renderer-owned" {
 }
 
 test "follow up prompt card does not over-pad when assistant ends with blank row" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -3454,7 +3476,7 @@ test "diff block writes are classified" {
     const c_alloc = std.heap.c_allocator;
     const diff_mod = @import("core/output/diff.zig");
 
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -3494,7 +3516,7 @@ test "diff block writes are classified" {
 }
 
 test "prompt card wraps image badges in OSC 8 hyperlinks" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -3529,7 +3551,7 @@ test "prompt card wraps image badges in OSC 8 hyperlinks" {
 }
 
 test "/version command writes version to transcript" {
-    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, io_mod.null_device, .{ .mode = .write_only });
     defer sink.close(io_mod.getIo());
 
     var app = App{
@@ -3704,6 +3726,10 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    if (comptime builtin.os.tag == .windows) {
+        _ = @import("core/shared/windows_api.zig");
+        _ = @import("core/shared/windows_process_tree.zig");
+    }
     _ = @import("napi_fetch_state.zig");
     _ = @import("acp/prompt.zig");
     _ = @import("core/output/activity_status.zig");
@@ -3834,11 +3860,9 @@ test {
     _ = @import("core/terminal/protocol.zig");
     _ = @import("core/terminal/host_policy.zig");
     _ = @import("core/terminal/shell_resolver.zig");
-    _ = @import("core/terminal/native_session.zig");
     _ = @import("core/terminal/recovery.zig");
     _ = @import("core/terminal/store.zig");
     _ = @import("core/terminal/host.zig");
-    _ = @import("core/terminal/tmux_session.zig");
     _ = @import("core/terminal/client.zig");
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");

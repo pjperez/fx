@@ -1353,7 +1353,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var ctx = AskContext.init(alloc, cfg, options.deps, startup.workspace_root);
     defer ctx.deinit();
     if (options.save_session) {
-        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+        _ = try ctx.session.initializeProfileUsage(alloc, io_mod.homeDir());
         ctx.session.attachProfileUsagePublisher(alloc);
     }
     ctx.use_process_interrupt_flag = options.deps.install_headless_interrupt;
@@ -5352,16 +5352,20 @@ const CrossThreadSigintState = struct {
 };
 
 fn sendRequestedSigints(state: *CrossThreadSigintState) void {
-    if (comptime !supports_headless_interrupt) return;
-    while (!state.stop.load(.seq_cst)) {
-        if (!state.request.swap(false, .seq_cst)) {
-            std.Thread.yield() catch std.atomic.spinLoopHint();
-            continue;
+    // POSIX signals do not exist on Windows.
+    const target_os = @import("builtin").os.tag;
+    if (comptime target_os == .windows) {} else {
+        if (comptime !supports_headless_interrupt) return;
+        while (!state.stop.load(.seq_cst)) {
+            if (!state.request.swap(false, .seq_cst)) {
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+                continue;
+            }
+            std.posix.kill(std.c.getpid(), std.posix.SIG.INT) catch {
+                state.failed.store(true, .seq_cst);
+            };
+            state.sent.store(true, .seq_cst);
         }
-        std.posix.kill(std.c.getpid(), std.posix.SIG.INT) catch {
-            state.failed.store(true, .seq_cst);
-        };
-        state.sent.store(true, .seq_cst);
     }
 }
 
@@ -7301,7 +7305,7 @@ test "saved ask ignores existing legacy task files" {
         tasks_path,
         .{
             .truncate = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
         },
     );
     tasks_file.close(io_mod.getIo());

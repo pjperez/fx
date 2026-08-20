@@ -1899,105 +1899,107 @@ pub fn captureHostAuthorityWithMcpView(
 }
 
 test "host authority capture applies explicit mode and permission capability policy" {
-    const Fixture = struct {
-        fn decode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-            return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
-        }
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const Fixture = struct {
+            fn decode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+                return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
+            }
 
-        fn call(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-            return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
-        }
+            fn call(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+                return .{ .failure = try ctx.allocator.dupe(u8, "unused") };
+            }
 
-        fn readsOnly(_: tool_dispatch.ToolInput) bool {
-            return true;
-        }
+            fn readsOnly(_: tool_dispatch.ToolInput) bool {
+                return true;
+            }
 
-        fn irreversible(_: tool_dispatch.ToolInput) bool {
-            return false;
-        }
+            fn irreversible(_: tool_dispatch.ToolInput) bool {
+                return false;
+            }
 
-        const seed = tool_dispatch.Tool{
-            .name = "inspect",
-            .description = "Inspect",
-            .gateway_schema = .{
+            const seed = tool_dispatch.Tool{
                 .name = "inspect",
                 .description = "Inspect",
-                .input_schema = .{},
+                .gateway_schema = .{
+                    .name = "inspect",
+                    .description = "Inspect",
+                    .input_schema = .{},
+                },
+                .decode = decode,
+                .call = call,
+                .reads_only_fn = readsOnly,
+                .irreversible_fn = irreversible,
+            };
+
+            const tools = [_]tool_dispatch.Tool{
+                seed,
+                renamed(seed, "list_files"),
+                renamed(seed, "mutate"),
+            };
+
+            fn renamed(tool: tool_dispatch.Tool, name: []const u8) tool_dispatch.Tool {
+                var result = tool;
+                result.name = name;
+                result.gateway_schema.name = name;
+                return result;
+            }
+        };
+        const modes = [_]mode_registry.ModeSpec{
+            .{ .id = "full", .name = "Full" },
+            .{ .id = "inspect", .name = "Inspect", .tool_policy = .read_only },
+        };
+        const tool_set = tool_set_contract.ToolSet{
+            .registry = .{ .tools = Fixture.tools[0..] },
+            .order = &.{ "inspect", "list_files", "mutate" },
+            .read_only_tool_names = &.{ "inspect", "list_files" },
+        };
+        const registry = mode_registry.Registry{
+            .default_mode_id = "full",
+            .modes = modes[0..],
+        };
+
+        var full = try captureHostAuthority(
+            std.testing.allocator,
+            .{ .tool_set = tool_set, .mode = .full },
+            .none,
+            &.{},
+            .{},
+            &.{},
+        );
+        defer full.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 3), full.tools.len);
+        try std.testing.expectEqualStrings("inspect", full.tools[0]);
+        try std.testing.expectEqualStrings("list_files", full.tools[1]);
+        try std.testing.expectEqualStrings("mutate", full.tools[2]);
+
+        var rules = [_]types.PermissionRule{.{
+            .permission = @constCast("list"),
+            .pattern = @constCast("*"),
+            .action = .deny,
+        }};
+        var grants = [_]types.PermissionGrant{.{
+            .tool_name = @constCast("inspect"),
+            .target_path = @constCast("workspace"),
+        }};
+        var restricted = try captureHostAuthority(
+            std.testing.allocator,
+            .{
+                .tool_set = tool_set,
+                .mode = .{ .active = .{ .registry = registry, .id = "inspect" } },
             },
-            .decode = decode,
-            .call = call,
-            .reads_only_fn = readsOnly,
-            .irreversible_fn = irreversible,
-        };
-
-        const tools = [_]tool_dispatch.Tool{
-            seed,
-            renamed(seed, "list_files"),
-            renamed(seed, "mutate"),
-        };
-
-        fn renamed(tool: tool_dispatch.Tool, name: []const u8) tool_dispatch.Tool {
-            var result = tool;
-            result.name = name;
-            result.gateway_schema.name = name;
-            return result;
-        }
-    };
-    const modes = [_]mode_registry.ModeSpec{
-        .{ .id = "full", .name = "Full" },
-        .{ .id = "inspect", .name = "Inspect", .tool_policy = .read_only },
-    };
-    const tool_set = tool_set_contract.ToolSet{
-        .registry = .{ .tools = Fixture.tools[0..] },
-        .order = &.{ "inspect", "list_files", "mutate" },
-        .read_only_tool_names = &.{ "inspect", "list_files" },
-    };
-    const registry = mode_registry.Registry{
-        .default_mode_id = "full",
-        .modes = modes[0..],
-    };
-
-    var full = try captureHostAuthority(
-        std.testing.allocator,
-        .{ .tool_set = tool_set, .mode = .full },
-        .none,
-        &.{},
-        .{},
-        &.{},
-    );
-    defer full.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 3), full.tools.len);
-    try std.testing.expectEqualStrings("inspect", full.tools[0]);
-    try std.testing.expectEqualStrings("list_files", full.tools[1]);
-    try std.testing.expectEqualStrings("mutate", full.tools[2]);
-
-    var rules = [_]types.PermissionRule{.{
-        .permission = @constCast("list"),
-        .pattern = @constCast("*"),
-        .action = .deny,
-    }};
-    var grants = [_]types.PermissionGrant{.{
-        .tool_name = @constCast("inspect"),
-        .target_path = @constCast("workspace"),
-    }};
-    var restricted = try captureHostAuthority(
-        std.testing.allocator,
-        .{
-            .tool_set = tool_set,
-            .mode = .{ .active = .{ .registry = registry, .id = "inspect" } },
-        },
-        .macos,
-        &.{"mcp__example"},
-        .{ .rules = rules[0..] },
-        grants[0..],
-    );
-    defer restricted.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), restricted.tools.len);
-    try std.testing.expectEqualStrings("inspect", restricted.tools[0]);
-    try std.testing.expectEqual(types.BackendKind.macos, restricted.sandbox_backend);
-    try std.testing.expectEqualStrings("mcp__example", restricted.integrations[0]);
-    try std.testing.expectEqualStrings("list", restricted.rules.rules[0].permission);
-    try std.testing.expectEqualStrings("inspect", restricted.grants[0].tool_name);
+            .macos,
+            &.{"mcp__example"},
+            .{ .rules = rules[0..] },
+            grants[0..],
+        );
+        defer restricted.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 1), restricted.tools.len);
+        try std.testing.expectEqualStrings("inspect", restricted.tools[0]);
+        try std.testing.expectEqual(types.BackendKind.macos, restricted.sandbox_backend);
+        try std.testing.expectEqualStrings("mcp__example", restricted.integrations[0]);
+        try std.testing.expectEqualStrings("list", restricted.rules.rules[0].permission);
+        try std.testing.expectEqualStrings("inspect", restricted.grants[0].tool_name);
+    }
 }
 
 fn commandTarget(command: domain.Command) ?[]const u8 {
@@ -2483,18 +2485,22 @@ fn closeIdentityProcessFd(fd: std.c.fd_t) void {
 }
 
 fn waitIdentityProcess(pid: std.c.pid_t) !u8 {
-    var status: c_int = 0;
-    while (true) {
-        const waited = std.c.waitpid(pid, &status, 0);
-        switch (std.c.errno(waited)) {
-            .SUCCESS => {
-                if (waited != pid or (status & 0x7f) != 0) {
-                    return error.ProcessWaitFailed;
-                }
-                return @intCast((status >> 8) & 0xff);
-            },
-            .INTR => continue,
-            else => return error.ProcessWaitFailed,
+    // Reaping a child by pid is POSIX-only; the tests using this helper are
+    // skipped on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ProcessWaitFailed else {
+        var status: c_int = 0;
+        while (true) {
+            const waited = std.c.waitpid(pid, &status, 0);
+            switch (std.c.errno(waited)) {
+                .SUCCESS => {
+                    if (waited != pid or (status & 0x7f) != 0) {
+                        return error.ProcessWaitFailed;
+                    }
+                    return @intCast((status >> 8) & 0xff);
+                },
+                .INTR => continue,
+                else => return error.ProcessWaitFailed,
+            }
         }
     }
 }
@@ -2509,125 +2515,130 @@ fn forkIdentityIssuer(
     start_fd: std.c.fd_t,
     result_fd: std.c.fd_t,
 ) !std.c.pid_t {
-    const pid = std.c.fork();
-    if (pid < 0) return error.ProcessForkFailed;
-    if (pid != 0) return pid;
+    // `fork` is POSIX-only; the tests using this helper are skipped on Windows.
+    if (comptime builtin.os.tag == .windows) return error.ProcessForkFailed else {
+        const pid = std.c.fork();
+        if (pid < 0) return error.ProcessForkFailed;
+        if (pid != 0) return pid;
 
-    writeIdentityProcessFd(ready_fd, &.{1}) catch std.c._exit(100);
-    var start: [1]u8 = undefined;
-    readIdentityProcessFd(start_fd, &start) catch std.c._exit(101);
-    const alloc = std.heap.c_allocator;
-    var sessions = session_store.Store.initFromHome(
-        alloc,
-        home,
-        workspace,
-    ) catch std.c._exit(102);
-    const epoch = issueManagerOperationIdentity(
-        alloc,
-        &sessions,
-        root_id,
-        .{},
-        invocation_id,
-        .model,
-    ) catch std.c._exit(103);
-    const result = [2]u64{ marker, epoch };
-    writeIdentityProcessFd(result_fd, std.mem.asBytes(&result)) catch
-        std.c._exit(104);
-    sessions.deinit(alloc);
-    std.c._exit(0);
+        writeIdentityProcessFd(ready_fd, &.{1}) catch std.c._exit(100);
+        var start: [1]u8 = undefined;
+        readIdentityProcessFd(start_fd, &start) catch std.c._exit(101);
+        const alloc = std.heap.c_allocator;
+        var sessions = session_store.Store.initFromHome(
+            alloc,
+            home,
+            workspace,
+        ) catch std.c._exit(102);
+        const epoch = issueManagerOperationIdentity(
+            alloc,
+            &sessions,
+            root_id,
+            .{},
+            invocation_id,
+            .model,
+        ) catch std.c._exit(103);
+        const result = [2]u64{ marker, epoch };
+        writeIdentityProcessFd(result_fd, std.mem.asBytes(&result)) catch
+            std.c._exit(104);
+        sessions.deinit(alloc);
+        std.c._exit(0);
+    }
 }
 
 test "independent processes receive distinct authoritative operation identities" {
-    if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    const root_id = "01J00000000000000000000000";
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, root_id);
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        if (comptime !@hasDecl(std.c, "fork")) return error.SkipZigTest;
+        const alloc = std.testing.allocator;
+        const root_id = "01J00000000000000000000000";
+        var env = try TestEnvironment.init(alloc);
+        defer env.deinit(alloc);
+        try env.createSession(alloc, root_id);
 
-    var ready_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeIdentityProcessFd(ready_pipe[0]);
-    defer closeIdentityProcessFd(ready_pipe[1]);
-    var start_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&start_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeIdentityProcessFd(start_pipe[0]);
-    defer closeIdentityProcessFd(start_pipe[1]);
-    var result_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&result_pipe) != 0) return error.ProcessPipeFailed;
-    defer closeIdentityProcessFd(result_pipe[0]);
-    defer closeIdentityProcessFd(result_pipe[1]);
+        var ready_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&ready_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeIdentityProcessFd(ready_pipe[0]);
+        defer closeIdentityProcessFd(ready_pipe[1]);
+        var start_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&start_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeIdentityProcessFd(start_pipe[0]);
+        defer closeIdentityProcessFd(start_pipe[1]);
+        var result_pipe: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&result_pipe) != 0) return error.ProcessPipeFailed;
+        defer closeIdentityProcessFd(result_pipe[0]);
+        defer closeIdentityProcessFd(result_pipe[1]);
 
-    const first_pid = try forkIdentityIssuer(
-        env.home,
-        env.workspace,
-        root_id,
-        "process-identity-a",
-        1,
-        ready_pipe[1],
-        start_pipe[0],
-        result_pipe[1],
-    );
-    const second_pid = forkIdentityIssuer(
-        env.home,
-        env.workspace,
-        root_id,
-        "process-identity-b",
-        2,
-        ready_pipe[1],
-        start_pipe[0],
-        result_pipe[1],
-    ) catch |err| {
-        writeIdentityProcessFd(start_pipe[1], &.{1}) catch {};
-        _ = waitIdentityProcess(first_pid) catch {};
-        return err;
-    };
-    var ready: [2]u8 = undefined;
-    try readIdentityProcessFd(ready_pipe[0], &ready);
-    try writeIdentityProcessFd(start_pipe[1], &.{ 1, 1 });
-    var results: [4]u64 = undefined;
-    try readIdentityProcessFd(result_pipe[0], std.mem.asBytes(&results));
-    try std.testing.expectEqual(@as(u8, 0), try waitIdentityProcess(first_pid));
-    try std.testing.expectEqual(@as(u8, 0), try waitIdentityProcess(second_pid));
+        const first_pid = try forkIdentityIssuer(
+            env.home,
+            env.workspace,
+            root_id,
+            "process-identity-a",
+            1,
+            ready_pipe[1],
+            start_pipe[0],
+            result_pipe[1],
+        );
+        const second_pid = forkIdentityIssuer(
+            env.home,
+            env.workspace,
+            root_id,
+            "process-identity-b",
+            2,
+            ready_pipe[1],
+            start_pipe[0],
+            result_pipe[1],
+        ) catch |err| {
+            writeIdentityProcessFd(start_pipe[1], &.{1}) catch {};
+            _ = waitIdentityProcess(first_pid) catch {};
+            return err;
+        };
+        var ready: [2]u8 = undefined;
+        try readIdentityProcessFd(ready_pipe[0], &ready);
+        try writeIdentityProcessFd(start_pipe[1], &.{ 1, 1 });
+        var results: [4]u64 = undefined;
+        try readIdentityProcessFd(result_pipe[0], std.mem.asBytes(&results));
+        try std.testing.expectEqual(@as(u8, 0), try waitIdentityProcess(first_pid));
+        try std.testing.expectEqual(@as(u8, 0), try waitIdentityProcess(second_pid));
 
-    var first_epoch: ?u64 = null;
-    var second_epoch: ?u64 = null;
-    for (0..2) |index| {
-        const marker = results[index * 2];
-        const epoch = results[index * 2 + 1];
-        if (marker == 1) {
-            first_epoch = epoch;
-        } else if (marker == 2) {
-            second_epoch = epoch;
-        } else {
-            return error.TestUnexpectedResult;
+        var first_epoch: ?u64 = null;
+        var second_epoch: ?u64 = null;
+        for (0..2) |index| {
+            const marker = results[index * 2];
+            const epoch = results[index * 2 + 1];
+            if (marker == 1) {
+                first_epoch = epoch;
+            } else if (marker == 2) {
+                second_epoch = epoch;
+            } else {
+                return error.TestUnexpectedResult;
+            }
         }
-    }
-    try std.testing.expect(first_epoch != null and second_epoch != null);
-    try std.testing.expect(first_epoch.? != second_epoch.?);
-    try std.testing.expect(
-        (first_epoch.? == 1 and second_epoch.? == 2) or
-            (first_epoch.? == 2 and second_epoch.? == 1),
-    );
+        try std.testing.expect(first_epoch != null and second_epoch != null);
+        try std.testing.expect(first_epoch.? != second_epoch.?);
+        try std.testing.expect(
+            (first_epoch.? == 1 and second_epoch.? == 2) or
+                (first_epoch.? == 2 and second_epoch.? == 1),
+        );
 
-    const first_retry = try issueManagerOperationIdentity(
-        alloc,
-        &env.store,
-        root_id,
-        .{},
-        "process-identity-a",
-        .model,
-    );
-    const second_retry = try issueManagerOperationIdentity(
-        alloc,
-        &env.store,
-        root_id,
-        .{},
-        "process-identity-b",
-        .model,
-    );
-    try std.testing.expectEqual(first_epoch.?, first_retry);
-    try std.testing.expectEqual(second_epoch.?, second_retry);
+        const first_retry = try issueManagerOperationIdentity(
+            alloc,
+            &env.store,
+            root_id,
+            .{},
+            "process-identity-a",
+            .model,
+        );
+        const second_retry = try issueManagerOperationIdentity(
+            alloc,
+            &env.store,
+            root_id,
+            .{},
+            "process-identity-b",
+            .model,
+        );
+        try std.testing.expectEqual(first_epoch.?, first_retry);
+        try std.testing.expectEqual(second_epoch.?, second_retry);
+    }
 }
 
 const TestAuthority = struct {

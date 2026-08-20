@@ -175,7 +175,7 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
         std.Io.Dir.createDirAbsolute(
             io_mod.getIo(),
             path,
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromMode(0o700),
         ) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 alloc.free(path);
@@ -554,7 +554,7 @@ fn streamSourceToFile(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -564,7 +564,7 @@ fn streamSourceToFile(
     var header: [64]u8 = undefined;
     var header_len: usize = 0;
     var read_buffer: [8192]u8 = undefined;
-    var reader = source.readerStreaming(io_mod.getIo(), &read_buffer);
+    var reader = io_mod.fileReader(source, &read_buffer);
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     var written: usize = 0;
     while (true) {
@@ -710,7 +710,7 @@ fn openOrCreateSnapshotDirectoryNoFollow(path: []const u8) !std.Io.Dir {
             parent.createDir(
                 io_mod.getIo(),
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsFromMode(0o700),
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return unsafeSnapshotPathError(create_err),
@@ -762,7 +762,7 @@ pub fn loadVerifiedSnapshot(
     errdefer bytes.deinit(alloc);
     try bytes.ensureTotalCapacity(alloc, size);
     var read_buf: [8192]u8 = undefined;
-    var reader = file.readerStreaming(io_mod.getIo(), &read_buf);
+    var reader = io_mod.fileReader(&file, &read_buf);
     var transfer_buf: [transfer_buffer_bytes]u8 = undefined;
     while (true) {
         try budget.check();
@@ -854,7 +854,7 @@ pub fn copyVerifiedImageAttachmentToDir(
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
             .resolve_beneath = true,
         },
     );
@@ -1516,11 +1516,10 @@ fn readImageHeaderFromFile(
     expected_size: usize,
     out: []u8,
 ) ![]const u8 {
-    const zio = io_mod.getIo();
     const header_len = @min(expected_size, out.len);
 
     var read_buf: [4096]u8 = undefined;
-    var r = file.reader(zio, &read_buf);
+    var r = io_mod.fileReader(file, &read_buf);
     const n = try r.interface.readSliceShort(out[0..header_len]);
     return out[0..n];
 }
@@ -2215,7 +2214,7 @@ test "extractInlineImageAttachments preserves image-looking directories" {
     try tmp.dir.createDir(
         std.testing.io,
         "photos.png",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
@@ -2905,7 +2904,7 @@ test "verified snapshot loading rejects a symlinked directory" {
     try tmp.dir.createDir(
         std.testing.io,
         "owned",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     {
         var owned = try tmp.dir.openDir(std.testing.io, "owned", .{});

@@ -824,8 +824,8 @@ fn readEventLineAt(
     var chunk: [8192]u8 = undefined;
     while (cursor < max_end) {
         const limit = @min(@as(u64, chunk.len), max_end - cursor);
-        const count = try file.readPositionalAll(
-            io_mod.getIo(),
+        const count = try io_mod.readPositionalAll(
+            file,
             chunk[0..@intCast(limit)],
             cursor,
         );
@@ -939,7 +939,7 @@ fn replayMigrationEvents(
     }
 
     var file_buffer: [8192]u8 = undefined;
-    var file_reader = file.reader(io_mod.getIo(), &file_buffer);
+    var file_reader = io_mod.fileReader(file, &file_buffer);
     var limit_buffer: [4096]u8 = undefined;
     var limited = file_reader.interface.limited(
         .limited64(position.through_event_log_bytes),

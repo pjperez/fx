@@ -737,7 +737,7 @@ fn readModelSafeContent(
     defer file.close(io_mod.getIo());
 
     var read_buf: [8192]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     const content_len = reader.interface.readSliceShort(content_buf) catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
     };
@@ -841,7 +841,7 @@ fn readTrace(alloc: Allocator, trace_path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer file.close(io_mod.getIo());
     var read_buf: [1024]u8 = undefined;
-    var reader = file.reader(std.testing.io, &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
 }
 

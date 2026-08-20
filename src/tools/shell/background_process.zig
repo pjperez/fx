@@ -53,6 +53,25 @@ const OwnedState = struct {
     child: std.process.Child,
 };
 
+/// Process identity crosses the text boundary as a number. `std.posix.pid_t` is
+/// a handle rather than an integer on Windows, so the numeric value is used
+/// there.
+fn formatPid(alloc: Allocator, pid: std.posix.pid_t) ![]u8 {
+    if (comptime builtin.os.tag == .windows) {
+        return std.fmt.allocPrint(alloc, "{d}", .{@intFromPtr(pid)});
+    }
+    return std.fmt.allocPrint(alloc, "{d}", .{pid});
+}
+
+fn parsePid(text: []const u8) !std.posix.pid_t {
+    if (comptime builtin.os.tag == .windows) {
+        const value = try std.fmt.parseInt(usize, text, 10);
+        if (value == 0) return error.InvalidPid;
+        return @ptrFromInt(value);
+    }
+    return std.fmt.parseInt(std.posix.pid_t, text, 10);
+}
+
 fn spawnPrepared(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -101,7 +120,7 @@ fn spawnPrepared(
     };
 
     const child_id = child.id orelse return error.SpawnFailed;
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{child_id});
+    const pid = try formatPid(alloc, child_id);
     var pid_owned = true;
     errdefer if (pid_owned) alloc.free(pid);
 
@@ -261,8 +280,7 @@ fn captureToken(
     alloc: Allocator,
     pid_text: []const u8,
 ) background_process_provider.ProviderError!process_supervisor.ProcessInstanceToken {
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
-        return error.InvalidPid;
+    const pid = parsePid(pid_text) catch return error.InvalidPid;
     return switch (builtin.os.tag) {
         .linux => captureLinuxToken(alloc, pid) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -498,12 +516,16 @@ fn signalProcess(
         },
     }
     if (!host.current().background_processes) return error.Unsupported;
-    const pid = std.fmt.parseInt(std.posix.pid_t, pid_text, 10) catch
-        return error.InvalidPid;
+    const pid = parsePid(pid_text) catch return error.InvalidPid;
     try signalPidTree(pid);
 }
 
 fn signalPidTree(root_pid: std.posix.pid_t) std.posix.KillError!void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        // Background processes are not a capability of these hosts, so callers
+        // are rejected before reaching here.
+        return error.ProcessNotFound;
+    }
     const descendants = collectDescendantPids(
         std.heap.page_allocator,
         root_pid,
@@ -557,13 +579,16 @@ fn sendSignal(
     signaled: *bool,
     first_error: *?std.posix.KillError,
 ) void {
-    std.posix.kill(pid, signal) catch |err| {
-        if (err != error.ProcessNotFound and first_error.* == null) {
-            first_error.* = err;
-        }
-        return;
-    };
-    signaled.* = true;
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) {} else {
+        std.posix.kill(pid, signal) catch |err| {
+            if (err != error.ProcessNotFound and first_error.* == null) {
+                first_error.* = err;
+            }
+            return;
+        };
+        signaled.* = true;
+    }
 }
 
 fn waitForProcessTreeExit(
@@ -590,11 +615,14 @@ fn anyProcessTreeMemberRunning(
 }
 
 fn isPidRunningRaw(pid: std.posix.pid_t) bool {
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-        error.ProcessNotFound => return false,
-        else => return true,
-    };
-    return true;
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) return false else {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return false,
+            else => return true,
+        };
+        return true;
+    }
 }
 
 fn collectDescendantPids(
@@ -814,20 +842,23 @@ fn waitForProcessExit(
 }
 
 fn processExists(pid_text: []const u8) bool {
-    switch (builtin.os.tag) {
-        .windows, .wasi => return true,
-        else => {},
+    // POSIX signals do not exist on Windows.
+    if (comptime builtin.os.tag == .windows) return false else {
+        switch (builtin.os.tag) {
+            .windows, .wasi => return true,
+            else => {},
+        }
+        const pid = std.fmt.parseInt(
+            std.posix.pid_t,
+            pid_text,
+            10,
+        ) catch return false;
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+            error.ProcessNotFound => return false,
+            else => return true,
+        };
+        return true;
     }
-    const pid = std.fmt.parseInt(
-        std.posix.pid_t,
-        pid_text,
-        10,
-    ) catch return false;
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-        error.ProcessNotFound => return false,
-        else => return true,
-    };
-    return true;
 }
 
 fn expectBlockedWrapperDoesNotExecute(
@@ -1101,8 +1132,8 @@ test "native provider writes through the verified borrowed output handle" {
 
     const output_file = output.childStdioFile();
     var bytes: [256]u8 = undefined;
-    const count = try output_file.readPositionalAll(
-        io_mod.getIo(),
+    const count = try io_mod.readPositionalAll(
+        output_file,
         &bytes,
         0,
     );

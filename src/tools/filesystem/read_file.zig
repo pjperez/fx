@@ -141,7 +141,7 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
     const read_len: usize = @intCast(@min(stat.size, max_snapshot_file_bytes));
     const content = try arena.alloc(u8, read_len);
     var read_buf: [8192]u8 = undefined;
-    var reader = file.reader(zio, &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     const actual_len = readIntoBuffer(&reader.interface, content) catch |err| {
         return readFileFailure(ctx.allocator, err, target);
     };

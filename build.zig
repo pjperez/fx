@@ -59,7 +59,9 @@ pub fn build(b: *std.Build) void {
             .stack_check = false,
             .stack_protector = false,
             .omit_frame_pointer = true,
-            .unwind_tables = .none,
+            // Windows x86_64 dispatches through table-driven unwinding, so the
+            // operating system needs unwind information for every function.
+            .unwind_tables = if (target.result.os.tag == .windows) .async else .none,
             .error_tracing = false,
             .strip = optimize != .Debug,
         }),
@@ -77,8 +79,15 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run fx");
     run_step.dependOn(&run_cmd.step);
 
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only run tests whose name contains this substring (repeatable)",
+    ) orelse &[_][]const u8{};
+
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = test_filters,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());

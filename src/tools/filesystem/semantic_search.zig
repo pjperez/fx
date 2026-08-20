@@ -487,7 +487,7 @@ fn readTrace(alloc: std.mem.Allocator, trace_path: []const u8) ![]u8 {
     var file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer file.close(io_mod.getIo());
     var read_buf: [1024]u8 = undefined;
-    var reader = file.reader(std.testing.io, &read_buf);
+    var reader = io_mod.fileReader(file, &read_buf);
     return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
 }
 

@@ -2502,7 +2502,7 @@ test "historical command detail keeps artifact handles after command block attac
     try tmp.dir.createDir(
         io_mod.getIo(),
         "session",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var session_dir = try tmp.dir.openDir(io_mod.getIo(), "session", .{
         .iterate = true,
@@ -4076,7 +4076,7 @@ fn sameFullDiffResolver(
 }
 
 pub const TranscriptRuntime = struct {
-    stdout_file: std.Io.File = std.Io.File.stdout(),
+    stdout_file: std.Io.File = io_mod.unresolved_std_file,
     sync_updates_enabled: bool = true,
     history_reset_uses_ris: bool = false,
     layout: Layout = undefined,
@@ -11921,7 +11921,7 @@ test "notification bell writes standalone BEL bytes" {
     var bytes: [1]u8 = undefined;
     try std.testing.expectEqual(
         @as(usize, 1),
-        try file.readPositionalAll(io_mod.getIo(), &bytes, 0),
+        try io_mod.readPositionalAll(file, &bytes, 0),
     );
     try std.testing.expectEqualSlices(u8, "\x07", &bytes);
 }

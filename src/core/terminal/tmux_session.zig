@@ -26,7 +26,7 @@ const max_launcher_config_bytes: usize = contracts.max_command_bytes * 6 +
 const max_lifecycle_bytes: usize = 8 * 5;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 const poll_ns: u64 = 5 * std.time.ns_per_ms;
 const cleanup_settle_deadline_ms: i64 = 500;
 const capture_accept_deadline_ms: i64 = 2_000;
@@ -405,7 +405,8 @@ pub const Backend = struct {
             killSessionAt(alloc, paths.socket, paths.session_name);
             cleanupSocketIfUnused(alloc, paths.socket);
         }
-        try std.Io.Dir.cwd().setFilePermissions(
+        try io_mod.setPathPermissions(
+            std.Io.Dir.cwd(),
             io_mod.getIo(),
             paths.socket,
             private_file_permissions,
@@ -564,7 +565,8 @@ pub const Backend = struct {
         const address = try std.Io.net.UnixAddress.init(self.paths.capture_socket);
         self.capture_server = try address.listen(io_mod.getIo(), .{});
         errdefer self.closeCaptureServer();
-        try std.Io.Dir.cwd().setFilePermissions(
+        try io_mod.setPathPermissions(
+            std.Io.Dir.cwd(),
             io_mod.getIo(),
             self.paths.capture_socket,
             private_file_permissions,
@@ -1018,7 +1020,8 @@ pub fn runLauncher(
         io_mod.getIo(),
         parsed.value.control_path,
     ) catch {};
-    try std.Io.Dir.cwd().setFilePermissions(
+    try io_mod.setPathPermissions(
+        std.Io.Dir.cwd(),
         io_mod.getIo(),
         parsed.value.control_path,
         private_file_permissions,
@@ -1722,7 +1725,7 @@ fn privateSocketExists(socket: []const u8) !bool {
         else => return err,
     };
     if (stat.kind != .unix_domain_socket or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.hasMode(stat.permissions, 0o600))
     {
         return error.PrivateTmuxEndpointRequired;
     }

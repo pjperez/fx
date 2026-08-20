@@ -3,6 +3,7 @@
 //! Each report uses a short-lived Unix socket. Failures and reply timeouts are
 //! ignored so the integration cannot block or terminate an fx session.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -181,12 +182,18 @@ pub const Client = struct {
 };
 
 fn applyResponseTimeout(stream: std.Io.net.Stream) void {
-    std.posix.setsockopt(
-        stream.socket.handle,
-        std.posix.SOL.SOCKET,
-        std.posix.SO.RCVTIMEO,
-        std.mem.asBytes(&response_timeout),
-    ) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        // Winsock takes a millisecond `DWORD` and `std.posix.setsockopt` is not
+        // available on Windows, so the bounded wait falls back to the socket's
+        // default behavior.
+    } else {
+        std.posix.setsockopt(
+            stream.socket.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&response_timeout),
+        ) catch {};
+    }
 }
 
 fn clampStatus(custom_status: ?[]const u8) ?[]const u8 {

@@ -278,7 +278,7 @@ const InstallMetadataReadError = error{
     OutOfMemory,
     StreamTooLong,
     UnexpectedEndOfFile,
-} || std.Io.File.StatError || std.Io.File.ReadPositionalError;
+} || std.Io.File.StatError || std.Io.File.ReadPositionalError || io_mod.PositionalError;
 
 const InstallMetadataReader = *const fn (Allocator, *std.Io.File) InstallMetadataReadError!?[]u8;
 

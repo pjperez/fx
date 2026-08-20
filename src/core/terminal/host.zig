@@ -4,9 +4,12 @@ const contracts = @import("contracts.zig");
 const protocol = @import("protocol.zig");
 const terminal_operation = @import("operation.zig");
 const policy = @import("host_policy.zig");
-const native_session = @import("native_session.zig");
+// The native session drives a pty and a POSIX process group, so it exists only
+// where terminal hosting is possible.
+const native_session = if (host_capabilities_supported) @import("native_session.zig") else struct {};
 const terminal_store = @import("store.zig");
 const host_capabilities = @import("../hosts/host.zig");
+const host_capabilities_supported = host_capabilities.terminalSupportForOs(builtin.os.tag).isSupported();
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -29,7 +32,7 @@ const listener_poll_ms = 50;
 const transport_hash_bytes: usize = 16;
 const transport_hash_context = "fx.terminal.transport.v1\x00";
 const socket_permissions: std.Io.File.Permissions = switch (builtin.os.tag) {
-    .macos, .linux => .fromMode(0o600),
+    .macos, .linux => io_mod.permissionsFromMode(0o600),
     else => .default_file,
 };
 
@@ -197,13 +200,23 @@ pub const Paths = struct {
     transport_root_path: []u8,
     endpoint_path: []u8,
 
+    /// Owner of the runtime transport directory. Windows has no `getuid`, and
+    /// terminal hosting is unsupported there, so the value is never consulted.
+    fn currentUid() std.c.uid_t {
+        if (comptime builtin.os.tag == .windows) {
+            return 0;
+        } else {
+            return std.c.getuid();
+        }
+    }
+
     pub fn open(alloc: Allocator, home: []const u8) !Paths {
         if (!isSupported()) return error.TerminalHostUnsupported;
         var selection = try resolveEndpointSelection(
             alloc,
             builtin.os.tag,
             home,
-            std.c.getuid(),
+            currentUid(),
         );
         var selection_owned = true;
         errdefer if (selection_owned) selection.deinit(alloc);
@@ -229,7 +242,7 @@ pub const Paths = struct {
         if (selection.uses_fallback) {
             transport_dir = try openRuntimeTransportDir(
                 selection.transport_root,
-                std.c.getuid(),
+                currentUid(),
             );
         }
         selection_owned = false;
@@ -290,7 +303,7 @@ fn openVerifiedPrivateRuntimeDir(
             parent.createDir(
                 zio,
                 name,
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsFromMode(0o700),
             ) catch |create_err| switch (create_err) {
                 error.PathAlreadyExists => {},
                 else => return create_err,
@@ -362,7 +375,7 @@ fn validatePrivateRuntimeDir(
 ) !void {
     if (stat.kind != .directory) return error.RuntimeDirectoryUnsafe;
     if (owner_uid != uid) return error.RuntimeDirectoryOwnerMismatch;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.hasMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -381,7 +394,7 @@ pub fn run(alloc: Allocator, config: Config) !void {
 }
 
 fn runSupported(alloc: Allocator, config: Config) !void {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var paths = try Paths.open(alloc, home);
     defer paths.deinit(alloc);
 
@@ -411,7 +424,8 @@ fn runSupported(alloc: Allocator, config: Config) !void {
     defer server.deinit(io_mod.getIo());
     var endpoint_created = true;
     defer if (endpoint_created) cleanupEndpoint(paths.endpointDir());
-    try paths.endpointDir().dir.setFilePermissions(
+    try io_mod.setPathPermissions(
+        paths.endpointDir().dir,
         io_mod.getIo(),
         endpoint_name,
         socket_permissions,
@@ -1261,7 +1275,7 @@ fn writeIdentity(
     instance: []const u8,
 ) !void {
     var pid_buffer: [32]u8 = undefined;
-    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{std.c.getpid()});
+    const pid = try std.fmt.bufPrint(&pid_buffer, "{d}", .{io_mod.currentProcessId()});
     const process_token = try process_provider.captureToken(
         alloc,
         pid,
@@ -1300,7 +1314,7 @@ pub fn identityEvidence(
     };
     defer file.close(io_mod.getIo());
     var read_buffer: [identity_max_bytes]u8 = undefined;
-    var reader = file.reader(io_mod.getIo(), &read_buffer);
+    var reader = io_mod.fileReader(file, &read_buffer);
     const bytes = reader.interface.allocRemaining(
         alloc,
         .limited(identity_max_bytes),
@@ -1364,7 +1378,7 @@ fn verifyEndpointPermissions(host_dir: *io_mod.VerifiedDir) !void {
         .{ .follow_symlinks = false },
     );
     if (stat.kind != .unix_domain_socket or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.hasMode(stat.permissions, 0o600))
     {
         return error.PrivateEndpointPermissionsUnsupported;
     }
@@ -1506,12 +1520,14 @@ test "host identity capture and reconciliation use the injected provider" {
 }
 
 test "endpoint paths honor the native sockaddr capacity" {
-    if (!isSupported()) return error.SkipZigTest;
-    const path_limit = comptime nativeEndpointPathLimit(builtin.os.tag).?;
-    var maximum: [path_limit - 1]u8 = @splat('x');
-    var oversized: [path_limit]u8 = @splat('x');
-    try validateEndpointPath(&maximum);
-    try std.testing.expectError(error.NameTooLong, validateEndpointPath(&oversized));
+    if (comptime !isSupported()) return error.SkipZigTest;
+    if (comptime isSupported()) {
+        const path_limit = comptime nativeEndpointPathLimit(builtin.os.tag).?;
+        var maximum: [path_limit - 1]u8 = @splat('x');
+        var oversized: [path_limit]u8 = @splat('x');
+        try validateEndpointPath(&maximum);
+        try std.testing.expectError(error.NameTooLong, validateEndpointPath(&oversized));
+    }
 }
 
 test "endpoint selection preserves short homes and deterministically separates long homes" {
@@ -1616,63 +1632,66 @@ test "endpoint selection allocation and unsupported targets fail closed" {
 }
 
 test "runtime transport directories reject symlinks non-private modes and foreign owners" {
-    if (!isSupported()) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        if (!isSupported()) return error.SkipZigTest;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
 
-    var private = try openVerifiedPrivateRuntimeDir(
-        tmp.dir,
-        "private",
-        std.c.getuid(),
-    );
-    defer private.close();
-    const private_stat = try private.dir.stat(std.testing.io);
-    try std.testing.expectEqual(
-        @as(std.posix.mode_t, 0o700),
-        private_stat.permissions.toMode() & 0o777,
-    );
-    try std.testing.expectError(
-        error.RuntimeDirectoryOwnerMismatch,
-        validatePrivateRuntimeDir(
-            private_stat,
-            std.c.getuid() + 1,
+        var private = try openVerifiedPrivateRuntimeDir(
+            tmp.dir,
+            "private",
             std.c.getuid(),
-        ),
-    );
+        );
+        defer private.close();
+        const private_stat = try private.dir.stat(std.testing.io);
+        try std.testing.expectEqual(
+            @as(io_mod.Mode, 0o700),
+            io_mod.permissionsModeOrZero(private_stat.permissions),
+        );
+        try std.testing.expectError(
+            error.RuntimeDirectoryOwnerMismatch,
+            validatePrivateRuntimeDir(
+                private_stat,
+                std.c.getuid() + 1,
+                std.c.getuid(),
+            ),
+        );
 
-    try tmp.dir.createDir(
-        std.testing.io,
-        "public",
-        std.Io.File.Permissions.fromMode(0o755),
-    );
-    try tmp.dir.setFilePermissions(
-        std.testing.io,
-        "public",
-        std.Io.File.Permissions.fromMode(0o755),
-        .{ .follow_symlinks = false },
-    );
-    const public_stat = try tmp.dir.statFile(
-        std.testing.io,
-        "public",
-        .{ .follow_symlinks = false },
-    );
-    try std.testing.expectEqual(
-        @as(std.posix.mode_t, 0o755),
-        public_stat.permissions.toMode() & 0o777,
-    );
-    try std.testing.expectError(
-        error.PrivateStatePermissionsUnsupported,
-        openVerifiedPrivateRuntimeDir(tmp.dir, "public", std.c.getuid()),
-    );
+        try tmp.dir.createDir(
+            std.testing.io,
+            "public",
+            io_mod.permissionsFromMode(0o755),
+        );
+        try io_mod.setPathPermissions(
+            tmp.dir,
+            std.testing.io,
+            "public",
+            io_mod.permissionsFromMode(0o755),
+            .{ .follow_symlinks = false },
+        );
+        const public_stat = try tmp.dir.statFile(
+            std.testing.io,
+            "public",
+            .{ .follow_symlinks = false },
+        );
+        try std.testing.expectEqual(
+            @as(io_mod.Mode, 0o755),
+            io_mod.permissionsModeOrZero(public_stat.permissions),
+        );
+        try std.testing.expectError(
+            error.PrivateStatePermissionsUnsupported,
+            openVerifiedPrivateRuntimeDir(tmp.dir, "public", std.c.getuid()),
+        );
 
-    try tmp.dir.symLink(
-        std.testing.io,
-        "private",
-        "linked",
-        .{ .is_directory = true },
-    );
-    try std.testing.expectError(
-        error.RuntimeDirectoryUnsafe,
-        openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid()),
-    );
+        try tmp.dir.symLink(
+            std.testing.io,
+            "private",
+            "linked",
+            .{ .is_directory = true },
+        );
+        try std.testing.expectError(
+            error.RuntimeDirectoryUnsafe,
+            openVerifiedPrivateRuntimeDir(tmp.dir, "linked", std.c.getuid()),
+        );
+    }
 }

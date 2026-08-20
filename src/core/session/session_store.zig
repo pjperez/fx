@@ -394,7 +394,7 @@ fn openUsageRecoveryProfileRoot(
     errdefer profile.close(zio);
     const stat = try profile.stat(zio);
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        !io_mod.hasMode(stat.permissions, 0o700))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -417,7 +417,7 @@ fn openUsageRecoveryDir(
     errdefer dir.close(io_mod.getIo());
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != 0o700)
+        !io_mod.hasMode(stat.permissions, 0o700))
     {
         return error.InvalidUsageRecoveryIndex;
     }
@@ -443,14 +443,14 @@ fn validateUsageRecoveryMarker(
         stat.nlink != 1 or
         stat.size == 0 or
         stat.size > max_usage_recovery_marker_bytes or
-        stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.hasMode(stat.permissions, 0o600))
     {
         return error.InvalidUsageRecoveryIndex;
     }
     var bytes: [max_usage_recovery_marker_bytes]u8 = undefined;
     const marker_len: usize = @intCast(stat.size);
-    const read = marker.readPositionalAll(
-        io_mod.getIo(),
+    const read = io_mod.readPositionalAll(
+        marker,
         bytes[0..marker_len],
         0,
     ) catch return error.InvalidUsageRecoveryIndex;
@@ -499,13 +499,13 @@ pub const Store = struct {
 
     /// Opens a writable store rooted at `$HOME`, creating the layout if needed.
     pub fn init(alloc: Allocator, workspace_root: []const u8) !Store {
-        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+        const home = io_mod.homeDir() orelse return error.HomeNotSet;
         return initWithHome(alloc, home, workspace_root, true);
     }
 
     /// Opens a read-only store rooted at `$HOME`; never creates layout.
     pub fn initReadOnly(alloc: Allocator, workspace_root: []const u8) !Store {
-        const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+        const home = io_mod.homeDir() orelse return error.HomeNotSet;
         return initWithHome(alloc, home, workspace_root, false);
     }
 
@@ -4559,14 +4559,14 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
         try tmp.dir.createDir(
             std.testing.io,
             sessions_name,
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromMode(0o700),
         );
         var sessions = try tmp.dir.openDir(std.testing.io, sessions_name, .{});
         defer sessions.close(std.testing.io);
         try sessions.createDir(
             std.testing.io,
             "session",
-            std.Io.File.Permissions.fromMode(0o700),
+            io_mod.permissionsFromMode(0o700),
         );
         var session_dir = try sessions.openDir(std.testing.io, "session", .{});
         defer session_dir.close(std.testing.io);
@@ -4575,7 +4575,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
             try tmp.dir.createDir(
                 std.testing.io,
                 "outside-images",
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsFromMode(0o700),
             );
             var outside_images = try tmp.dir.openDir(std.testing.io, "outside-images", .{});
             defer outside_images.close(std.testing.io);
@@ -4607,7 +4607,7 @@ test "session snapshot locator resolver rejects symlink leaves and directories" 
             try session_dir.createDir(
                 std.testing.io,
                 "images",
-                std.Io.File.Permissions.fromMode(0o700),
+                io_mod.permissionsFromMode(0o700),
             );
             var images_dir = try session_dir.openDir(std.testing.io, "images", .{});
             defer images_dir.close(std.testing.io);
@@ -4708,12 +4708,12 @@ fn loadedWriterBelongsToRoot(
 }
 
 fn prepareWritableSessionDir(dir: std.Io.Dir) !void {
-    const permissions = std.Io.File.Permissions.fromMode(0o700);
-    dir.setPermissions(io_mod.getIo(), permissions) catch
+    const permissions = io_mod.permissionsFromMode(0o700);
+    io_mod.setDirPermissions(dir, io_mod.getIo(), permissions) catch
         return error.PrivateStatePermissionsUnsupported;
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.SessionPathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.hasMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
 }
@@ -4904,7 +4904,7 @@ fn makeRawSessionsEntry(store: Store, name: []const u8) !void {
     sessions.dir.createDir(
         io_mod.getIo(),
         name,
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     ) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -5564,13 +5564,13 @@ fn corruptPendingReplacementTimestampForTest(
         return error.TestUnexpectedResult;
     const tail = try alloc.alloc(u8, tail_len);
     defer alloc.free(tail);
-    const count = try file.readPositionalAll(io_mod.getIo(), tail, prior_bytes);
+    const count = try io_mod.readPositionalAll(file, tail, prior_bytes);
     if (count != tail.len) return error.TestUnexpectedResult;
     const needle = "\"timestamp_ms\":20";
     const match = std.mem.lastIndexOf(u8, tail, needle) orelse
         return error.TestUnexpectedResult;
     tail[match + needle.len - 1] = '1';
-    try file.writePositionalAll(io_mod.getIo(), tail, prior_bytes);
+    try io_mod.writePositionalAll(file, tail, prior_bytes);
     try file.sync(io_mod.getIo());
 }
 
@@ -7301,7 +7301,7 @@ test "same-workspace append defers latest cache contention and marks cache dirty
     defer token.close(io_mod.getIo());
     const token_stat = try token.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.file, token_stat.kind);
-    try std.testing.expectEqual(@as(u32, 0o600), token_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o600), io_mod.permissionsModeOrZero(token_stat.permissions));
     const token_bytes = try io_mod.readFileToEnd(
         alloc,
         &token,
@@ -7336,7 +7336,7 @@ test "deferred token failure prevents a same-workspace canonical commit" {
         .read = true,
         .truncate = false,
         .exclusive = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromMode(0o600),
         .resolve_beneath = true,
     });
     obstacle.close(io_mod.getIo());
@@ -8412,7 +8412,7 @@ test "doctor reports unsafe managed child artifacts" {
     try session_dir.createDir(
         io_mod.getIo(),
         "tool-results",
-        std.Io.File.Permissions.fromMode(0o755),
+        io_mod.permissionsFromMode(0o755),
     );
     var managed_dir = try session_dir.openDir(
         io_mod.getIo(),
@@ -8420,7 +8420,7 @@ test "doctor reports unsafe managed child artifacts" {
         .{ .iterate = true, .follow_symlinks = false },
     );
     defer managed_dir.close(io_mod.getIo());
-    try managed_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o755));
+    try io_mod.setDirPermissions(managed_dir, io_mod.getIo(), io_mod.permissionsFromMode(0o755));
 
     var diagnostics = try ctx.store.inspectForDoctor(alloc);
     defer freeDoctorDiagnostics(alloc, &diagnostics);
@@ -8501,14 +8501,15 @@ test "doctor ignores legacy task records" {
         .{ .iterate = true },
     );
     defer session_dir.close(io_mod.getIo());
-    try session_dir.setPermissions(
+    try io_mod.setDirPermissions(
+        session_dir,
         io_mod.getIo(),
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     try session_dir.createDir(
         io_mod.getIo(),
         "tasks",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const corrupt_path = try std.fs.path.join(alloc, &.{
         session_path,
@@ -9641,7 +9642,7 @@ test "recovery verifies and copies persisted image snapshots into the new sessio
     try std.Io.Dir.createDirAbsolute(
         io_mod.getIo(),
         source_images,
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     const image_bytes = "\x89PNG\r\n\x1a\nrecovery-image";
     var digest_bytes: [32]u8 = undefined;
@@ -9664,7 +9665,7 @@ test "recovery verifies and copies persisted image snapshots into the new sessio
         .{
             .truncate = false,
             .exclusive = true,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = io_mod.permissionsFromMode(0o600),
         },
     );
     try image_file.writeStreamingAll(io_mod.getIo(), image_bytes);
@@ -11213,7 +11214,7 @@ test "summary index marker preparation rejects an uncommitted session" {
     try sessions.dir.createDir(
         io_mod.getIo(),
         "index.pending",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
 
     var state = try testDurableState(alloc, "marker-prepare-failure", ctx.workspace);
@@ -11943,7 +11944,7 @@ test "missing home is empty for reads and bootstrapped privately for writes" {
     defer home_dir.close(io_mod.getIo());
     const home_stat = try home_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(std.Io.File.Kind.directory, home_stat.kind);
-    try std.testing.expectEqual(@as(u32, 0o700), home_stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o700), io_mod.permissionsModeOrZero(home_stat.permissions));
     const sessions_path = try std.fs.path.join(alloc, &.{ missing_home, ".fx", "sessions" });
     defer alloc.free(sessions_path);
     try std.Io.Dir.accessAbsolute(io_mod.getIo(), sessions_path, .{});
@@ -12038,7 +12039,7 @@ test "first write creates only the private session layout" {
     const durable_stat = try durable_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(
         @as(u64, 0o700),
-        durable_stat.permissions.toMode() & 0o777,
+        io_mod.permissionsModeOrZero(durable_stat.permissions),
     );
     var durable_iter = durable_dir.iterate();
     const sessions_entry = (try durable_iter.next(io_mod.getIo())) orelse
@@ -12055,7 +12056,7 @@ test "first write creates only the private session layout" {
     const sessions_stat = try sessions_dir.stat(io_mod.getIo());
     try std.testing.expectEqual(
         @as(u64, 0o700),
-        sessions_stat.permissions.toMode() & 0o777,
+        io_mod.permissionsModeOrZero(sessions_stat.permissions),
     );
     var sessions_iter = sessions_dir.iterate();
     var saw_session = false;

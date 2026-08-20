@@ -23,10 +23,12 @@ const task_helpers = @import("../tasks/task_helpers.zig");
 const Allocator = std.mem.Allocator;
 
 test {
-    _ = background_launch_identity;
-    _ = background_launch_output;
-    _ = background_record_liveness;
-    _ = background_record_restore;
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        _ = background_launch_identity;
+        _ = background_launch_output;
+        _ = background_record_liveness;
+        _ = background_record_restore;
+    }
 }
 
 pub const RuntimeContextSnapshot = process_supervisor.RuntimeContextSnapshot;
@@ -2605,19 +2607,23 @@ const TestPreparedProcess = struct {
     }
 
     fn waitForOwnedChild(self: *TestPreparedProcess, timeout_ms: i64) bool {
-        const started_ms = io_mod.milliTimestamp();
-        while (true) {
-            const pid = self.child.id orelse return true;
-            if (std.c.waitpid(pid, null, std.c.W.NOHANG) == pid) {
-                self.child.id = null;
-                self.alloc.free(self.pid);
-                self.alloc.destroy(self);
-                return true;
+        // Reaping a child by pid is POSIX-only, and background processes are not
+        // a Windows capability.
+        if (comptime builtin.os.tag == .windows) return true else {
+            const started_ms = io_mod.milliTimestamp();
+            while (true) {
+                const pid = self.child.id orelse return true;
+                if (std.c.waitpid(pid, null, std.c.W.NOHANG) == pid) {
+                    self.child.id = null;
+                    self.alloc.free(self.pid);
+                    self.alloc.destroy(self);
+                    return true;
+                }
+                if (io_mod.milliTimestamp() - started_ms >= timeout_ms) {
+                    return false;
+                }
+                io_mod.sleep(10 * std.time.ns_per_ms);
             }
-            if (io_mod.milliTimestamp() - started_ms >= timeout_ms) {
-                return false;
-            }
-            io_mod.sleep(10 * std.time.ns_per_ms);
         }
     }
 
@@ -2692,7 +2698,7 @@ fn wrapTestPreparedProcess(
 ) !background_process_provider.PreparedProcess {
     const state = try alloc.create(TestPreparedProcess);
     errdefer alloc.destroy(state);
-    const pid = try std.fmt.allocPrint(alloc, "{d}", .{child.id.?});
+    const pid = try std.fmt.allocPrint(alloc, "{d}", .{io_mod.pidNumber(child.id.?)});
     state.* = .{
         .alloc = alloc,
         .child = child,
@@ -3110,113 +3116,117 @@ test "durable long lived persistence failure keeps the degraded release" {
 }
 
 test "identity-indeterminate process-local cleanup retains display reservation" {
-    const alloc = std.testing.allocator;
-    blocked_wrapper_cleanup_timeout_ms_for_test = 10;
-    defer blocked_wrapper_cleanup_timeout_ms_for_test = null;
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        blocked_wrapper_cleanup_timeout_ms_for_test = 10;
+        defer blocked_wrapper_cleanup_timeout_ms_for_test = null;
 
-    var runtime = testBackgroundRuntime();
-    defer runtime.deinit(alloc);
-    var prepared = try runtime.prepareBackgroundLaunch(
-        alloc,
-        .process_local_long_lived,
-    );
-    const retained_identity = prepared.identity;
-    const retained_display_id = retained_identity.displayId();
-    var spawned = try spawnDelayedUnreleasedHandshakeForTest(alloc);
-
-    try std.testing.expect(
-        runtime.failBlockedBackgroundLaunch(
+        var runtime = testBackgroundRuntime();
+        defer runtime.deinit(alloc);
+        var prepared = try runtime.prepareBackgroundLaunch(
             alloc,
-            &prepared,
-            &spawned,
-            null,
-            error.BackgroundWrapperNotReady,
-        ) == error.BackgroundProcessIdentityIndeterminate,
-    );
-    try std.testing.expect(
-        runtime.hasRetainedIndeterminateIdentity(retained_identity),
-    );
+            .process_local_long_lived,
+        );
+        const retained_identity = prepared.identity;
+        const retained_display_id = retained_identity.displayId();
+        var spawned = try spawnDelayedUnreleasedHandshakeForTest(alloc);
 
-    runtime.supervisor.next_background_process_id = retained_display_id;
-    var next = try runtime.prepareBackgroundLaunch(
-        alloc,
-        .process_local_long_lived,
-    );
-    try std.testing.expect(next.identity.displayId() != retained_display_id);
-    runtime.cancelPreparedBackgroundLaunch(alloc, &next);
+        try std.testing.expect(
+            runtime.failBlockedBackgroundLaunch(
+                alloc,
+                &prepared,
+                &spawned,
+                null,
+                error.BackgroundWrapperNotReady,
+            ) == error.BackgroundProcessIdentityIndeterminate,
+        );
+        try std.testing.expect(
+            runtime.hasRetainedIndeterminateIdentity(retained_identity),
+        );
+
+        runtime.supervisor.next_background_process_id = retained_display_id;
+        var next = try runtime.prepareBackgroundLaunch(
+            alloc,
+            .process_local_long_lived,
+        );
+        try std.testing.expect(next.identity.displayId() != retained_display_id);
+        runtime.cancelPreparedBackgroundLaunch(alloc, &next);
+    }
 }
 
 test "identity-indeterminate durable cleanup retains stable pair reservation" {
-    const alloc = std.testing.allocator;
-    blocked_wrapper_cleanup_timeout_ms_for_test = 10;
-    defer blocked_wrapper_cleanup_timeout_ms_for_test = null;
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest else {
+        const alloc = std.testing.allocator;
+        blocked_wrapper_cleanup_timeout_ms_for_test = 10;
+        defer blocked_wrapper_cleanup_timeout_ms_for_test = null;
 
-    const StableIds = struct {
-        var calls: usize = 0;
-        const first = StableBackgroundRecordId{
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        const StableIds = struct {
+            var calls: usize = 0;
+            const first = StableBackgroundRecordId{
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+            };
+            const second = StableBackgroundRecordId{
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+            };
+
+            fn next() anyerror!StableBackgroundRecordId {
+                defer calls += 1;
+                return if (calls < 2) first else second;
+            }
         };
-        const second = StableBackgroundRecordId{
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-        };
+        StableIds.calls = 0;
+        stable_record_id_for_test = StableIds.next;
+        defer stable_record_id_for_test = null;
 
-        fn next() anyerror!StableBackgroundRecordId {
-            defer calls += 1;
-            return if (calls < 2) first else second;
-        }
-    };
-    StableIds.calls = 0;
-    stable_record_id_for_test = StableIds.next;
-    defer stable_record_id_for_test = null;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const background_dir = try initBackgroundDir(alloc, tmp.dir);
+        defer alloc.free(background_dir);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const background_dir = try initBackgroundDir(alloc, tmp.dir);
-    defer alloc.free(background_dir);
-
-    var runtime = testBackgroundRuntime();
-    defer runtime.deinit(alloc);
-    try runtime.enablePersistence(alloc, background_dir);
-    var prepared = try runtime.prepareBackgroundLaunch(
-        alloc,
-        .durable_long_lived,
-    );
-    const retained_identity = prepared.identity;
-    const retained_display_id = retained_identity.displayId();
-    var spawned = try spawnDelayedUnreleasedHandshakeForTest(alloc);
-
-    try std.testing.expect(
-        runtime.failBlockedBackgroundLaunch(
+        var runtime = testBackgroundRuntime();
+        defer runtime.deinit(alloc);
+        try runtime.enablePersistence(alloc, background_dir);
+        var prepared = try runtime.prepareBackgroundLaunch(
             alloc,
-            &prepared,
-            &spawned,
-            null,
-            error.BackgroundWrapperNotReady,
-        ) == error.BackgroundProcessIdentityIndeterminate,
-    );
-    try std.testing.expect(
-        runtime.hasRetainedIndeterminateIdentity(retained_identity),
-    );
+            .durable_long_lived,
+        );
+        const retained_identity = prepared.identity;
+        const retained_display_id = retained_identity.displayId();
+        var spawned = try spawnDelayedUnreleasedHandshakeForTest(alloc);
 
-    runtime.supervisor.next_background_process_id = retained_display_id;
-    var next = try runtime.prepareBackgroundLaunch(
-        alloc,
-        .durable_long_lived,
-    );
-    defer runtime.cancelPreparedBackgroundLaunch(alloc, &next);
-    try std.testing.expect(next.identity.displayId() != retained_display_id);
-    switch (next.identity) {
-        .durable_long_lived => |identity| {
-            try std.testing.expectEqual(
-                StableIds.second,
-                identity.background_record_id,
-            );
-        },
-        else => return error.TestExpectedEqual,
+        try std.testing.expect(
+            runtime.failBlockedBackgroundLaunch(
+                alloc,
+                &prepared,
+                &spawned,
+                null,
+                error.BackgroundWrapperNotReady,
+            ) == error.BackgroundProcessIdentityIndeterminate,
+        );
+        try std.testing.expect(
+            runtime.hasRetainedIndeterminateIdentity(retained_identity),
+        );
+
+        runtime.supervisor.next_background_process_id = retained_display_id;
+        var next = try runtime.prepareBackgroundLaunch(
+            alloc,
+            .durable_long_lived,
+        );
+        defer runtime.cancelPreparedBackgroundLaunch(alloc, &next);
+        try std.testing.expect(next.identity.displayId() != retained_display_id);
+        switch (next.identity) {
+            .durable_long_lived => |identity| {
+                try std.testing.expectEqual(
+                    StableIds.second,
+                    identity.background_record_id,
+                );
+            },
+            else => return error.TestExpectedEqual,
+        }
+        io_mod.sleep(250 * std.time.ns_per_ms);
     }
-    io_mod.sleep(250 * std.time.ns_per_ms);
 }
 
 fn expectNoBackgroundLifecycleTracePathLeak(source: []const u8) !void {

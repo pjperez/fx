@@ -13,9 +13,14 @@ const Channel = update_target.Channel;
 const Target = update_target.Target;
 
 fn setRecvTimeout(conn: *std.http.Client.Connection) void {
-    const sock = conn.stream_writer.stream.socket.handle;
-    const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
-    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    if (comptime builtin.os.tag == .windows) {
+        // `std.posix.setsockopt` is unavailable on Windows; the connection keeps
+        // the socket's default receive timeout.
+    } else {
+        const sock = conn.stream_writer.stream.socket.handle;
+        const timeout = std.posix.timeval{ .sec = recv_timeout_sec, .usec = 0 };
+        std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+    }
 }
 
 pub const cdn_base = "https://releases.fx.sh";
@@ -46,8 +51,12 @@ fn isLoopbackE2eUpgradeBase(url: []const u8) bool {
     return std.mem.eql(u8, host, "127.0.0.1");
 }
 
-pub const platform = platformFromTarget() orelse
-    @compileError("unsupported platform for auto-upgrade (requires macOS or Linux, x86_64 or aarch64)");
+/// Auto-upgrade ships POSIX tarballs and swaps the binary in place. Windows has
+/// no published archive yet, and a running `.exe` cannot be overwritten, so the
+/// feature is unavailable there and `fx upgrade` says so.
+pub const supported = platformFromTarget() != null;
+
+pub const platform = platformFromTarget() orelse "unsupported";
 
 fn platformFromTarget() ?[]const u8 {
     const os: ?[]const u8 = switch (builtin.os.tag) {

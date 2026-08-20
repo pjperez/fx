@@ -737,12 +737,13 @@ fn deadlineExpired(cfg: sandbox.Config) bool {
 }
 
 fn signalGroup(group_id: ?std.posix.pid_t, force: bool) void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-    const pid = group_id orelse return;
-    std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
-        error.ProcessNotFound => {},
-        else => debug_trace.logf("core", "direct command signal failed err={s}", .{@errorName(err)}),
-    };
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return else {
+        const pid = group_id orelse return;
+        std.posix.kill(-pid, if (force) std.posix.SIG.KILL else std.posix.SIG.TERM) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => debug_trace.logf("core", "direct command signal failed err={s}", .{@errorName(err)}),
+        };
+    }
 }
 
 fn closeChildPipes(child: *std.process.Child) void {

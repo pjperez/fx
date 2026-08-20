@@ -40,7 +40,7 @@ const marker_ack_timeout_ms: i64 = tmux_session.marker_acknowledgement_timeout_m
 const command_release_byte: u8 = 2;
 const control_nonce_len: usize = 32;
 const marker_frame_len: usize = control_nonce_len + 1;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 const default_dimensions: contracts.Dimensions = .{
     .rows = 24,
     .columns = 80,
@@ -447,7 +447,8 @@ pub fn runLauncher(alloc: Allocator) !void {
         io_mod.getIo(),
         parsed.value.control_path,
     ) catch {};
-    try std.Io.Dir.cwd().setFilePermissions(
+    try io_mod.setPathPermissions(
+        std.Io.Dir.cwd(),
         io_mod.getIo(),
         parsed.value.control_path,
         private_file_permissions,

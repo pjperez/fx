@@ -2762,7 +2762,7 @@ test "refresh traces snapshot allocation failures and retains roots" {
     var trace_file = try std.Io.Dir.openFileAbsolute(std.testing.io, trace_path, .{});
     defer trace_file.close(std.testing.io);
     var read_buf: [1024]u8 = undefined;
-    var reader = trace_file.reader(std.testing.io, &read_buf);
+    var reader = io_mod.fileReader(trace_file, &read_buf);
     const trace = try reader.interface.allocRemaining(alloc, std.Io.Limit.limited(4096));
     defer alloc.free(trace);
     try std.testing.expect(std.mem.find(u8, trace, "file index scope snapshot failed") != null);

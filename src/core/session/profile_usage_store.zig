@@ -13,8 +13,8 @@ const max_record_bytes: usize = 16 * 1024;
 const max_records: usize = 200_000;
 const compaction_threshold_bytes: u64 = 8 * 1024 * 1024;
 const retention_ms: i64 = std.time.ms_per_day * 35;
-const private_dir_permissions = std.Io.Dir.Permissions.fromMode(0o700);
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
+const private_dir_permissions = io_mod.permissionsFromMode(0o700);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
 
 pub const AppendOutcome = enum {
     appended,
@@ -209,7 +209,7 @@ pub const Store = struct {
                 file.?.close(io_mod.getIo());
                 file = null;
             } else {
-                try file.?.writePositionalAll(io_mod.getIo(), append_bytes.written(), boundary);
+                try io_mod.writePositionalAll(file.?, append_bytes.written(), boundary);
                 file.?.sync(io_mod.getIo()) catch return error.UsageWriteFailed;
             }
         }
@@ -271,7 +271,7 @@ pub const Store = struct {
         const durable_home = self.durable_home orelse return;
         const stat = try durable_home.dir.stat(io_mod.getIo());
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        if (stat.permissions.toMode() & 0o777 != 0o700) {
+        if (!io_mod.hasMode(stat.permissions, 0o700)) {
             return error.PrivateStatePermissionsUnsupported;
         }
     }
@@ -293,13 +293,14 @@ pub const Store = struct {
                 else => return error.DurableLayoutFailed,
             };
         }
-        self.durable_home.?.dir.setPermissions(
+        io_mod.setDirPermissions(
+            self.durable_home.?.dir,
             io_mod.getIo(),
             private_dir_permissions,
         ) catch return error.PrivateStatePermissionsUnsupported;
         const stat = try self.durable_home.?.dir.stat(io_mod.getIo());
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        if (stat.permissions.toMode() & 0o777 != 0o700) {
+        if (!io_mod.hasMode(stat.permissions, 0o700)) {
             return error.PrivateStatePermissionsUnsupported;
         }
     }
@@ -331,7 +332,7 @@ pub const Store = struct {
         if (stat.kind != .file or stat.nlink != 1) {
             return error.DurablePathUnsafe;
         }
-        if (stat.permissions.toMode() & 0o777 != 0o600) {
+        if (!io_mod.hasMode(stat.permissions, 0o600)) {
             return error.PrivateStatePermissionsUnsupported;
         }
 
@@ -368,7 +369,7 @@ pub const Store = struct {
         if (stat.kind != .file or stat.nlink != 1) {
             return error.DurablePathUnsafe;
         }
-        if (stat.permissions.toMode() & 0o777 != 0o600) {
+        if (!io_mod.hasMode(stat.permissions, 0o600)) {
             return error.PrivateStatePermissionsUnsupported;
         }
         return true;
@@ -416,7 +417,7 @@ pub const Store = struct {
                 return error.PrivateStatePermissionsUnsupported;
         }
         const verified = if (writable) try file.stat(zio) else initial;
-        if (verified.permissions.toMode() & 0o777 != 0o600) {
+        if (!io_mod.hasMode(verified.permissions, 0o600)) {
             return error.PrivateStatePermissionsUnsupported;
         }
         if (created) {
@@ -447,7 +448,7 @@ pub const Store = struct {
             return error.UsageCapacityExceeded;
         const bytes = try alloc.alloc(u8, byte_len);
         defer alloc.free(bytes);
-        const read_count = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
+        const read_count = try io_mod.readPositionalAll(file, bytes, 0);
         if (read_count != byte_len) return error.UsageReadFailed;
         if (bytes[bytes.len - 1] != '\n') return error.UsageStoreIncomplete;
 
@@ -721,7 +722,7 @@ fn inspectTail(file: std.Io.File) !TailBoundary {
     const length = try file.length(io_mod.getIo());
     if (length == 0) return .{ .length = 0, .incomplete = false };
     var last: [1]u8 = undefined;
-    const count = try file.readPositionalAll(io_mod.getIo(), &last, length - 1);
+    const count = try io_mod.readPositionalAll(file, &last, length - 1);
     if (count == 1 and last[0] == '\n') {
         return .{ .length = length, .incomplete = false };
     }
@@ -731,8 +732,8 @@ fn inspectTail(file: std.Io.File) !TailBoundary {
     while (cursor > 0) {
         const start = cursor - @min(cursor, buffer.len);
         const read_len: usize = @intCast(cursor - start);
-        const read_count = try file.readPositionalAll(
-            io_mod.getIo(),
+        const read_count = try io_mod.readPositionalAll(
+            file,
             buffer[0..read_len],
             start,
         );
@@ -758,8 +759,8 @@ fn copyFilePrefix(
     while (offset < boundary) {
         const remaining = boundary - offset;
         const read_len: usize = @intCast(@min(remaining, buffer.len));
-        const read_count = try file.readPositionalAll(
-            io_mod.getIo(),
+        const read_count = try io_mod.readPositionalAll(
+            file,
             buffer[0..read_len],
             offset,
         );
@@ -1222,7 +1223,7 @@ test "profile usage store repairs an incomplete tail and records the gap" {
 
     var file = (try store.openUsage(true, false)).?;
     const length = try file.length(io_mod.getIo());
-    try file.writePositionalAll(io_mod.getIo(), "{\"schema_version\":1", length);
+    try io_mod.writePositionalAll(file, "{\"schema_version\":1", length);
     try file.sync(io_mod.getIo());
     file.close(io_mod.getIo());
     try std.testing.expectError(error.UsageStoreIncomplete, store.load(alloc));
@@ -1271,7 +1272,7 @@ test "profile usage store records a repaired tail when the replayed fact is dupl
 
     var file = (try store.openUsage(true, false)).?;
     const length = try file.length(io_mod.getIo());
-    try file.writePositionalAll(io_mod.getIo(), "{\"schema_version\":1", length);
+    try io_mod.writePositionalAll(file, "{\"schema_version\":1", length);
     try file.sync(io_mod.getIo());
     file.close(io_mod.getIo());
 
@@ -1296,11 +1297,11 @@ test "profile usage store leaves an incomplete tail intact when repair exceeds r
     try tmp.dir.createDir(
         io_mod.getIo(),
         ".fx",
-        std.Io.Dir.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
     defer profile.close(io_mod.getIo());
-    profile.setPermissions(io_mod.getIo(), .fromMode(0o700)) catch
+    io_mod.setDirPermissions(profile, io_mod.getIo(), io_mod.permissionsFromMode(0o700)) catch
         return error.SkipZigTest;
 
     var contents: std.Io.Writer.Allocating = .init(alloc);
@@ -1350,11 +1351,11 @@ test "profile usage store repairs an existing profile directory to private mode"
     try tmp.dir.createDir(
         io_mod.getIo(),
         ".fx",
-        std.Io.File.Permissions.fromMode(0o755),
+        io_mod.permissionsFromMode(0o755),
     );
     var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
     defer profile.close(io_mod.getIo());
-    profile.setPermissions(io_mod.getIo(), .fromMode(0o755)) catch
+    io_mod.setDirPermissions(profile, io_mod.getIo(), io_mod.permissionsFromMode(0o755)) catch
         return error.SkipZigTest;
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -1374,7 +1375,7 @@ test "profile usage store repairs an existing profile directory to private mode"
     );
 
     const stat = try profile.stat(io_mod.getIo());
-    try std.testing.expectEqual(@as(u32, 0o700), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o700), io_mod.permissionsModeOrZero(stat.permissions));
 }
 
 test "profile usage reads reject an unsafe profile directory without repairing it" {
@@ -1384,11 +1385,11 @@ test "profile usage reads reject an unsafe profile directory without repairing i
     try tmp.dir.createDir(
         io_mod.getIo(),
         ".fx",
-        std.Io.File.Permissions.fromMode(0o755),
+        io_mod.permissionsFromMode(0o755),
     );
     var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
     defer profile.close(io_mod.getIo());
-    profile.setPermissions(io_mod.getIo(), .fromMode(0o755)) catch
+    io_mod.setDirPermissions(profile, io_mod.getIo(), io_mod.permissionsFromMode(0o755)) catch
         return error.SkipZigTest;
 
     var contents: std.Io.Writer.Allocating = .init(alloc);
@@ -1421,7 +1422,7 @@ test "profile usage reads reject an unsafe profile directory without repairing i
     );
 
     const stat = try profile.stat(io_mod.getIo());
-    try std.testing.expectEqual(@as(u32, 0o755), stat.permissions.toMode() & 0o777);
+    try std.testing.expectEqual(@as(u32, 0o755), io_mod.permissionsModeOrZero(stat.permissions));
 }
 
 test "profile usage store decodes a large ledger with stable id indexing" {
@@ -1431,11 +1432,11 @@ test "profile usage store decodes a large ledger with stable id indexing" {
     try tmp.dir.createDir(
         io_mod.getIo(),
         ".fx",
-        std.Io.File.Permissions.fromMode(0o700),
+        io_mod.permissionsFromMode(0o700),
     );
     var profile = try tmp.dir.openDir(io_mod.getIo(), ".fx", .{ .iterate = true });
     defer profile.close(io_mod.getIo());
-    profile.setPermissions(io_mod.getIo(), .fromMode(0o700)) catch
+    io_mod.setDirPermissions(profile, io_mod.getIo(), io_mod.permissionsFromMode(0o700)) catch
         return error.SkipZigTest;
 
     const record_count: usize = 4096;

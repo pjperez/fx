@@ -53,8 +53,8 @@ pub const deferred_cache_dir = "deferred";
 pub const relationship_migration_candidate_limit: usize = 16;
 const relationship_migration_read_bytes: usize = 64 * 1024;
 const relationship_migration_overlap_bytes: u64 = 512;
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
+const private_file_permissions = io_mod.permissionsFromMode(0o600);
+const private_dir_permissions = io_mod.permissionsFromMode(0o700);
 
 const DeferredCachePositionJson = struct {
     log_generation: []const u8,
@@ -206,7 +206,7 @@ fn openDeferredCacheDirectory(
 fn requirePrivateCacheDirectory(dir: std.Io.Dir) !void {
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory or
-        stat.permissions.toMode() & 0o777 != private_dir_permissions.toMode())
+        !io_mod.permissionsEql(stat.permissions, private_dir_permissions))
     {
         return error.InvalidSessionIndex;
     }
@@ -279,7 +279,7 @@ fn readDeferredCacheTokenFromDirectory(
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.nlink != 1 or
-        stat.permissions.toMode() & 0o777 != private_file_permissions.toMode() or
+        !io_mod.permissionsEql(stat.permissions, private_file_permissions) or
         stat.size == 0 or stat.size > max_deferred_cache_token_bytes)
     {
         return error.InvalidSessionIndex;
@@ -368,7 +368,7 @@ fn readCachePrefix(path: []const u8, buffer: []u8) !?[]const u8 {
         else => return err,
     };
     defer file.close(io_mod.getIo());
-    const count = try file.readPositionalAll(io_mod.getIo(), buffer, 0);
+    const count = try io_mod.readPositionalAll(file, buffer, 0);
     return buffer[0..count];
 }
 
@@ -1412,7 +1412,7 @@ pub fn readRelationshipMigrationCandidatePage(
     }
 
     var buffer: [relationship_migration_read_bytes]u8 = undefined;
-    const count = try file.readPositionalAll(io_mod.getIo(), &buffer, start);
+    const count = try io_mod.readPositionalAll(file, &buffer, start);
     if (count == 0) return error.InvalidSessionIndex;
     const bytes = buffer[0..count];
     if (start == 0 and
@@ -1480,8 +1480,8 @@ pub fn refreshRelationshipMigrationSnapshot(
         return error.InvalidSessionIndex;
     }
     var observed_prefix: [prefix_len]u8 = undefined;
-    if (try source.readPositionalAll(
-        io_mod.getIo(),
+    if (try io_mod.readPositionalAll(
+        source,
         &observed_prefix,
         0,
     ) != observed_prefix.len or
@@ -1491,8 +1491,8 @@ pub fn refreshRelationshipMigrationSnapshot(
         return error.InvalidSessionIndex;
     }
     var suffix: [2]u8 = undefined;
-    if (try source.readPositionalAll(
-        io_mod.getIo(),
+    if (try io_mod.readPositionalAll(
+        source,
         &suffix,
         source_stat.size - suffix.len,
     ) != suffix.len or !std.mem.eql(u8, &suffix, "]}")) {
@@ -1529,7 +1529,7 @@ pub fn refreshRelationshipMigrationSnapshot(
         return error.InvalidSessionIndex;
     if (target_stat.kind != .file or
         target_stat.nlink != 1 or
-        target_stat.permissions.toMode() & 0o777 != 0o600)
+        !io_mod.hasMode(target_stat.permissions, 0o600))
     {
         return error.InvalidSessionIndex;
     }
@@ -1539,8 +1539,8 @@ pub fn refreshRelationshipMigrationSnapshot(
     while (offset < source_stat.size) {
         const remaining = source_stat.size - offset;
         const chunk_len: usize = @intCast(@min(remaining, buffer.len));
-        const count = source.readPositionalAll(
-            io_mod.getIo(),
+        const count = io_mod.readPositionalAll(
+            source,
             buffer[0..chunk_len],
             offset,
         ) catch return error.InvalidSessionIndex;
@@ -1644,7 +1644,7 @@ fn openVerifiedSessionIndexFile(
     };
     errdefer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600) {
+    if (stat.kind != .file or stat.nlink != 1 or !io_mod.hasMode(stat.permissions, 0o600)) {
         return error.InvalidSessionIndex;
     }
     return file;
@@ -2309,7 +2309,7 @@ test "deferred cache token reader rejects non-private files" {
     });
     try file.setPermissions(
         std.testing.io,
-        std.Io.File.Permissions.fromMode(0o644),
+        io_mod.permissionsFromMode(0o644),
     );
     file.close(std.testing.io);
 

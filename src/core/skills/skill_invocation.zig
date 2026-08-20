@@ -695,7 +695,7 @@ pub fn freeExecuteResult(alloc: Allocator, result: ExecuteResult) void {
 }
 
 fn loadVisibleSkillsForContext(alloc: Allocator, workspace_root: []const u8, skills_dir: []const u8) !skill_runtime.SkillDiscovery {
-    if (io_mod.getenv("HOME") orelse homeFromSkillsDir(skills_dir)) |home| {
+    if (io_mod.homeDir() orelse homeFromSkillsDir(skills_dir)) |home| {
         return skill_runtime.loadVisibleSkills(alloc, workspace_root, home, skills_dir, test_root_policy);
     }
     return skill_runtime.loadVisibleSkills(alloc, workspace_root, null, skills_dir, test_root_policy);
@@ -763,7 +763,7 @@ fn readSkillResourceFile(
     const read_len = @min(observed_bytes, @min(effective_limit +| 3, safety_ceiling));
     const bytes = try alloc.alloc(u8, read_len);
     errdefer alloc.free(bytes);
-    const bytes_read = try file.readPositionalAll(io_mod.getIo(), bytes, 0);
+    const bytes_read = try io_mod.readPositionalAll(file, bytes, 0);
     if (bytes_read != read_len) return error.UnexpectedEndOfFile;
     const allowed_len = context_limits.lineSafePrefixLength(bytes, effective_limit);
     if (allowed_len != bytes.len) {
@@ -785,7 +785,7 @@ fn validateSkillResourceUtf8(file: *std.Io.File, byte_count: usize, observed_byt
 
     while (read_offset < byte_count) {
         const wanted = @min(chunk.len, byte_count - read_offset);
-        const bytes_read = try file.readPositionalAll(io_mod.getIo(), chunk[0..wanted], read_offset);
+        const bytes_read = try io_mod.readPositionalAll(file, chunk[0..wanted], read_offset);
         if (bytes_read != wanted) return error.UnexpectedEndOfFile;
         validator.append(chunk[0..bytes_read]) catch return error.BinarySkillResource;
         read_offset += bytes_read;
@@ -795,7 +795,7 @@ fn validateSkillResourceUtf8(file: *std.Io.File, byte_count: usize, observed_byt
             return error.BinarySkillResource;
         const lookahead_len = @min(sequence_len - validator.pending_len, observed_bytes - byte_count);
         var lookahead: [3]u8 = undefined;
-        const bytes_read = try file.readPositionalAll(io_mod.getIo(), lookahead[0..lookahead_len], byte_count);
+        const bytes_read = try io_mod.readPositionalAll(file, lookahead[0..lookahead_len], byte_count);
         if (bytes_read != lookahead_len) return error.UnexpectedEndOfFile;
         validator.append(lookahead[0..bytes_read]) catch return error.BinarySkillResource;
     }
