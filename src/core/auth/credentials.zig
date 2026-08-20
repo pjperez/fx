@@ -7,6 +7,7 @@ const oauth = @import("oauth.zig");
 const oauth_session = @import("oauth_session.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const secret_at_rest = @import("secret_at_rest.zig");
 const types = @import("../shared/types.zig");
 
 pub const Source = types.CredentialSource;
@@ -162,7 +163,16 @@ const FxLoginRefreshMode = enum { if_needed, force };
 
 pub const missing_credential_message = "Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "Fx needs access to Vercel AI Gateway. Run /login to sign in, /setup to use an API key, or set AI_GATEWAY_API_KEY.";
-pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
+
+/// Where fx encrypts what it stores, a credential that cannot be read is far more
+/// likely to be one this account cannot decrypt than one that is malformed, and
+/// the repair is to establish it again rather than to inspect the file. Both
+/// stored sources are named because either can fail this way.
+pub const unreadable_store_message = if (secret_at_rest.encrypts)
+    "Fx could not read a stored credential from " ++ stored_key_backend_label ++
+        ", which is encrypted for the current Windows user. It may have been saved by a different account or altered since. Run fx login to sign in again, or fx setup to store an API key again. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY."
+else
+    "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 pub const Credential = struct {
     token: []u8,

@@ -6,6 +6,7 @@ const io_mod = @import("../shared/io.zig");
 const keychain = @import("native_keychain.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const secret = @import("../auth/secret.zig");
+const secret_at_rest = @import("../auth/secret_at_rest.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -86,7 +87,7 @@ fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
 }
 
 fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
-    const home = io_mod.getenv("HOME") orelse {
+    const home = io_mod.homeDir() orelse {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
     };
@@ -130,7 +131,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
         debug_trace.logf("stored_key", "load failed step=stat err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or !io_mod.isOwnerOnly(stat.permissions)) {
         debug_trace.logf("stored_key", "load failed step=permissions err=StoredKeyInsecure", .{});
         return error.StoredKeyInsecure;
     }
@@ -145,6 +146,29 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
     var borrowed = false;
     defer if (!borrowed) secret.zeroAndFree(alloc, bytes);
 
+    // A key stored before fx encrypted credentials still loads, and the next write
+    // seals it. A file that claims to be encrypted but will not decrypt is reported
+    // as unreadable rather than as absent, so the operator is told a key is there
+    // and cannot be used instead of being asked to set one they already set.
+    const opened = secret_at_rest.open(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("stored_key", "load failed step=decrypt err={s}", .{@errorName(err)});
+            return error.StoredKeyUnreadable;
+        },
+    };
+    if (opened) |plaintext| {
+        var keep = false;
+        defer if (!keep) secret.zeroAndFree(alloc, plaintext);
+        const inner = std.mem.trim(u8, plaintext, "\r\n");
+        if (inner.len == 0) return null;
+        if (inner.len == plaintext.len) {
+            keep = true;
+            return plaintext;
+        }
+        return try alloc.dupe(u8, inner);
+    }
+
     const trimmed = std.mem.trim(u8, bytes, "\r\n");
     if (trimmed.len == 0) return null;
     if (trimmed.len == bytes.len) {
@@ -155,7 +179,7 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
 }
 
 fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
-    const home = io_mod.getenv("HOME") orelse return writeFailed("home", error.HomeNotSet);
+    const home = io_mod.homeDir() orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
         .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
             return writeFailed("open_home", err);
@@ -172,9 +196,22 @@ fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
 }
 
 /// `durableReplaceVerified` creates the file at 0600 and re-stats it after the rename,
-/// so the mode this store depends on is enforced rather than assumed.
+/// so the mode this store depends on is enforced rather than assumed. Where the mode
+/// cannot be enforced the bytes are encrypted instead, and a failure to encrypt fails
+/// the write rather than falling back to storing the key in the clear.
 fn storeInDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, value: []const u8) StoreError!void {
-    io_mod.durableReplaceVerified(alloc, fx_dir, profile_paths.api_key_file_name, value) catch |err| switch (err) {
+    const sealed = secret_at_rest.seal(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return writeFailed("encrypt", err),
+    };
+    defer if (sealed) |bytes| alloc.free(bytes);
+
+    io_mod.durableReplaceVerified(
+        alloc,
+        fx_dir,
+        profile_paths.api_key_file_name,
+        sealed orelse value,
+    ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return writeFailed("replace", err),
     };
@@ -206,7 +243,7 @@ test "stored key file round-trips byte-identically at mode 0600" {
     try storeInDir(std.testing.allocator, &fx_dir, written);
 
     const stat = try tmp.dir.statFile(std.testing.io, profile_paths.api_key_file_name, .{});
-    try std.testing.expect(stat.permissions.toMode() & 0o777 == 0o600);
+    try std.testing.expect(io_mod.hasMode(stat.permissions, 0o600));
 
     const read_back = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
         return error.TestUnexpectedMissingStoredKey;
@@ -227,7 +264,7 @@ test "stored key file refusal stays distinguishable from absence" {
     try storeInDir(std.testing.allocator, &fx_dir, "vt2-secret-value");
     for ([_]std.posix.mode_t{ 0o640, 0o604, 0o644 }) |mode| {
         var file = try tmp.dir.openFile(std.testing.io, profile_paths.api_key_file_name, .{ .mode = .read_write });
-        try file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(mode));
+        try file.setPermissions(std.testing.io, io_mod.permissionsFromMode(mode));
         file.close(std.testing.io);
 
         try std.testing.expectError(
@@ -258,4 +295,53 @@ test "stored key file tolerates a trailing newline and rejects an empty value" {
     try std.testing.expect((try loadFromDir(std.testing.allocator, &fx_dir.dir)) == null);
 
     try std.testing.expectError(error.StoredKeyWriteFailed, store(std.testing.allocator, ""));
+}
+
+test "a stored key is unreadable on disk where fx encrypts credentials" {
+    if (comptime !secret_at_rest.encrypts) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    const written = "vt-on-disk-must-not-be-readable";
+    try storeInDir(std.testing.allocator, &fx_dir, written);
+
+    var file = try tmp.dir.openFile(std.testing.io, profile_paths.api_key_file_name, .{});
+    defer file.close(std.testing.io);
+    const raw = try io_mod.readFileToEnd(std.testing.allocator, &file, max_key_file_bytes);
+    defer std.testing.allocator.free(raw);
+
+    try std.testing.expect(std.mem.indexOf(u8, raw, written) == null);
+    try std.testing.expect(secret_at_rest.isSealed(raw));
+}
+
+test "a plaintext stored key keeps loading and is encrypted by the next write" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    const legacy = "vt-legacy-plaintext-key";
+    try io_mod.durableReplaceVerified(
+        std.testing.allocator,
+        &fx_dir,
+        profile_paths.api_key_file_name,
+        legacy,
+    );
+
+    const migrated = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer secret.zeroAndFree(std.testing.allocator, migrated);
+    try std.testing.expectEqualStrings(legacy, migrated);
+
+    try storeInDir(std.testing.allocator, &fx_dir, migrated);
+    const reread = (try loadFromDir(std.testing.allocator, &fx_dir.dir)) orelse
+        return error.TestUnexpectedMissingStoredKey;
+    defer secret.zeroAndFree(std.testing.allocator, reread);
+    try std.testing.expectEqualStrings(legacy, reread);
 }

@@ -5,6 +5,7 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
+const secret_at_rest = @import("secret_at_rest.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -45,7 +46,7 @@ fn signalE2ELockContention(fx_dir: std.Io.Dir) void {
     if (!std.mem.eql(u8, enabled, "1")) return;
     var file = fx_dir.createFile(io_mod.getIo(), e2e_lock_contention_file_name, .{
         .truncate = true,
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromMode(0o600),
     }) catch return;
     defer file.close(io_mod.getIo());
     file.writeStreamingAll(io_mod.getIo(), "contended\n") catch {};
@@ -102,9 +103,7 @@ const NativeMutation = struct {
     }
 
     pub fn save(self: *Mutation, alloc: Allocator, session: Session) !void {
-        const text = try stringify(alloc, session);
-        defer secret.zeroAndFree(alloc, text);
-        try io_mod.durableReplaceVerified(alloc, &self.fx_dir, auth_file_name, text);
+        return saveToDir(alloc, &self.fx_dir, session);
     }
 
     pub fn delete(self: *Mutation) !DeleteOutcome {
@@ -222,7 +221,7 @@ fn isLoopbackHttpUrl(url: []const u8, require_origin: bool) bool {
 
 pub fn load(alloc: Allocator) !?Session {
     if (comptime host_target.is_wasm) return loadFromHost(alloc, js_host_auth.oauth_session_store);
-    const home = io_mod.getenv("HOME") orelse {
+    const home = io_mod.homeDir() orelse {
         debug_trace.logf("auth", "session load skipped step=home err=HomeNotSet", .{});
         return null;
     };
@@ -256,6 +255,17 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
     };
 }
 
+/// Encryption happens here rather than inside the durable write so the plaintext
+/// serialization stays the one thing the session format defines, and so a failure
+/// to protect the bytes stops the write instead of relaxing into a plaintext one.
+fn saveToDir(alloc: Allocator, fx_dir: *io_mod.VerifiedDir, session: Session) !void {
+    const text = try stringify(alloc, session);
+    defer secret.zeroAndFree(alloc, text);
+    const sealed = try secret_at_rest.seal(alloc, text);
+    defer if (sealed) |bytes| alloc.free(bytes);
+    try io_mod.durableReplaceVerified(alloc, fx_dir, auth_file_name, sealed orelse text);
+}
+
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session {
     var file = fx_dir.openFile(io_mod.getIo(), auth_file_name, .{
         .mode = .read_only,
@@ -272,14 +282,29 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir, mode: LoadMode) !?Session 
     defer file.close(io_mod.getIo());
 
     const stat = try file.stat(io_mod.getIo());
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) {
+    if (stat.kind != .file or !io_mod.isOwnerOnly(stat.permissions)) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return null;
     }
 
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
     defer secret.zeroAndFree(alloc, bytes);
-    return parse(alloc, bytes) catch |err| switch (err) {
+
+    // A profile written before fx encrypted credentials still loads, and the next
+    // save seals it. Only a file that announces itself as encrypted and then fails
+    // to decrypt is refused, because reporting it as absent would tell the operator
+    // they are signed out when the real problem is that the credential belongs to a
+    // different Windows account or has been altered.
+    const opened = secret_at_rest.open(alloc, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("auth", "session load failed step=decrypt err={s}", .{@errorName(err)});
+            return error.AuthSessionUndecryptable;
+        },
+    };
+    defer if (opened) |plaintext| secret.zeroAndFree(alloc, plaintext);
+
+    return parse(alloc, opened orelse bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => {
             debug_trace.logf("auth", "session load failed step=parse err={s}", .{@errorName(err)});
@@ -304,7 +329,7 @@ pub fn beginExistingMutation() !?Mutation {
     if (comptime host_target.is_wasm) {
         return @as(?Mutation, HostMutation.init(js_host_auth.oauth_session_store));
     }
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
@@ -318,7 +343,7 @@ pub fn beginExistingMutation() !?Mutation {
 }
 
 fn beginMutation() !Mutation {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var home_dir = io_mod.VerifiedDir{
         .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
     };
@@ -367,15 +392,15 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
 
     const initial_stat = try dir.stat(io_mod.getIo());
     if (initial_stat.kind != .directory) return error.DurablePathUnsafe;
-    if (initial_stat.permissions.toMode() & 0o200 == 0) {
+    if (!io_mod.isPermissionWritable(initial_stat.permissions)) {
         return error.PrivateStatePermissionsUnsupported;
     }
-    dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700)) catch {
+    io_mod.setDirPermissions(dir, io_mod.getIo(), io_mod.permissionsFromMode(0o700)) catch {
         return error.PrivateStatePermissionsUnsupported;
     };
     const stat = try dir.stat(io_mod.getIo());
     if (stat.kind != .directory) return error.DurablePathUnsafe;
-    if (stat.permissions.toMode() & 0o777 != 0o700) {
+    if (!io_mod.hasMode(stat.permissions, 0o700)) {
         return error.PrivateStatePermissionsUnsupported;
     }
     return .{ .dir = dir };
@@ -630,7 +655,7 @@ test "oauth session loading propagates allocation failures" {
     defer tmp.cleanup();
 
     var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = io_mod.permissionsFromMode(0o600),
     });
     try file.writeStreamingAll(
         std.testing.io,
@@ -655,6 +680,82 @@ test "OAuth mutation loads report auth file open failures" {
     try std.testing.expectError(
         error.SymLinkLoop,
         loadFromDir(std.testing.allocator, &tmp.dir, .report_open_failure),
+    );
+}
+
+test "a saved auth session hides its tokens on disk where fx encrypts credentials" {
+    if (comptime !secret_at_rest.encrypts) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    var session = try parse(alloc, test_session_json);
+    defer session.deinit(alloc);
+    try saveToDir(alloc, &fx_dir, session);
+
+    var file = try tmp.dir.openFile(std.testing.io, auth_file_name, .{});
+    const raw = try io_mod.readFileToEnd(alloc, &file, max_auth_file_bytes);
+    file.close(std.testing.io);
+    defer alloc.free(raw);
+
+    try std.testing.expect(secret_at_rest.isSealed(raw));
+    try std.testing.expect(std.mem.indexOf(u8, raw, session.access_token) == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, session.refresh_token) == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "refresh_token") == null);
+
+    var loaded = (try loadFromDir(alloc, &fx_dir.dir, .report_open_failure)) orelse
+        return error.TestUnexpectedMissingSession;
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings(session.access_token, loaded.access_token);
+    try std.testing.expectEqualStrings(session.refresh_token, loaded.refresh_token);
+}
+
+test "a plaintext auth session keeps loading and is encrypted by the next save" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fx_dir = io_mod.VerifiedDir{
+        .dir = try tmp.dir.openDir(io_mod.getIo(), ".", .{ .iterate = true, .follow_symlinks = false }),
+    };
+    defer fx_dir.close();
+
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
+        .permissions = io_mod.permissionsFromMode(0o600),
+    });
+    try file.writeStreamingAll(std.testing.io, test_session_json);
+    file.close(std.testing.io);
+
+    var migrated = (try loadFromDir(alloc, &fx_dir.dir, .report_open_failure)) orelse
+        return error.TestUnexpectedMissingSession;
+    defer migrated.deinit(alloc);
+    try std.testing.expectEqualStrings("access", migrated.access_token);
+
+    try saveToDir(alloc, &fx_dir, migrated);
+    var reread = (try loadFromDir(alloc, &fx_dir.dir, .report_open_failure)) orelse
+        return error.TestUnexpectedMissingSession;
+    defer reread.deinit(alloc);
+    try std.testing.expectEqualStrings("access", reread.access_token);
+    try std.testing.expectEqualStrings("refresh", reread.refresh_token);
+}
+
+test "an undecryptable auth session is refused rather than reported as absent" {
+    if (comptime !secret_at_rest.encrypts) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(std.testing.io, auth_file_name, .{
+        .permissions = io_mod.permissionsFromMode(0o600),
+    });
+    try file.writeStreamingAll(std.testing.io, "{\"v\":1,\"dpapi\":\"bm90LWEtcmVhbC1ibG9i\"}\n");
+    file.close(std.testing.io);
+
+    try std.testing.expectError(
+        error.AuthSessionUndecryptable,
+        loadFromDir(std.testing.allocator, &tmp.dir, .tolerate_open_failure),
     );
 }
 
