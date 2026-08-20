@@ -549,7 +549,7 @@ fn resolveSavedDirectory(
             const arena = arena_state.allocator();
             const identity = pathing.resolveCreateTargetFromNearestExisting(
                 arena,
-                "/",
+                pathing.filesystemRoot(normalized),
                 normalized,
             ) catch |resolve_err| switch (resolve_err) {
                 error.OutOfMemory => return error.OutOfMemory,

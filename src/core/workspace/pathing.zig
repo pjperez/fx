@@ -640,6 +640,17 @@ fn resolveBoundedIntermediateSymlink(
 /// a volume, so the prefix is a disk designator such as `C:\` or a UNC share
 /// such as `\\server\share\`. Every canonical path in this file begins with its
 /// root prefix, and no `..` may pop back past it.
+/// The root that every component of `absolute` hangs from: a single separator
+/// on POSIX, and the volume the path is rooted at on Windows.
+///
+/// Callers use this where the boundary has to mean "anywhere on the filesystem"
+/// rather than a workspace. Writing `/` there is a POSIX assumption: on Windows
+/// it names no volume, so a containment check against it rejects every path.
+pub fn filesystemRoot(absolute: []const u8) []const u8 {
+    const prefix_len = rootPrefixLen(absolute) catch return std.fs.path.sep_str;
+    return absolute[0..prefix_len];
+}
+
 fn rootPrefixLen(path: []const u8) FileTargetResolveError!usize {
     if (comptime @import("builtin").os.tag != .windows) {
         if (path.len == 0 or path[0] != std.fs.path.sep) return error.InvalidPath;
@@ -1111,10 +1122,12 @@ pub fn workspaceRelativePath(
 pub fn ensureParentDirectories(path_abs: []const u8) !void {
     const parent = std.fs.path.dirname(path_abs) orelse return;
 
-    var root = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), "/", .{});
+    const root_prefix = filesystemRoot(parent);
+    var root = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), root_prefix, .{});
     defer root.close(io_mod.getIo());
 
-    const relative_to_root = std.mem.trimStart(u8, parent, "/");
+    if (parent.len <= root_prefix.len) return;
+    const relative_to_root = parent[root_prefix.len..];
     if (relative_to_root.len == 0) return;
     try root.createDirPath(io_mod.getIo(), relative_to_root);
 }
@@ -1166,12 +1179,30 @@ fn invalidPathEntryBasename(basename: []const u8) bool {
     return basename.len == 0 or std.mem.eql(u8, basename, ".") or std.mem.eql(u8, basename, "..");
 }
 
+/// Windows accepts either separator in the paths it is handed, so a candidate
+/// spelled with `/` names the same file as one spelled with `\`. Comparing the
+/// two byte for byte would place a workspace file outside its own workspace and
+/// send it down the external path instead. POSIX keeps comparing bytes exactly,
+/// where `\` is an ordinary filename character.
 pub fn pathInside(root: []const u8, candidate: []const u8) bool {
     if (std.mem.eql(u8, root, candidate)) return true;
-    if (!std.mem.startsWith(u8, candidate, root)) return false;
     if (root.len == 0) return false;
-    if (root[root.len - 1] == std.fs.path.sep) return true;
-    return candidate.len > root.len and candidate[root.len] == std.fs.path.sep;
+    if (!pathPrefixMatches(root, candidate)) return false;
+    if (isPathSeparator(root[root.len - 1])) return true;
+    return candidate.len > root.len and isPathSeparator(candidate[root.len]);
+}
+
+fn pathPrefixMatches(prefix: []const u8, candidate: []const u8) bool {
+    if (comptime @import("builtin").os.tag != .windows) {
+        return std.mem.startsWith(u8, candidate, prefix);
+    }
+    if (candidate.len < prefix.len) return false;
+    for (prefix, candidate[0..prefix.len]) |left, right| {
+        if (left == right) continue;
+        if (isPathSeparator(left) and isPathSeparator(right)) continue;
+        return false;
+    }
+    return true;
 }
 
 test "pathInside preserves exact child empty-root and prefix semantics" {
