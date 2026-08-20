@@ -25,6 +25,18 @@ It's open source (Apache-2.0), model-agnostic, and suitable for both local and c
 curl -fsSL https://fx.sh/setup.sh | bash
 ```
 
+On Windows, download `fx-windows-x86_64.zip` from the
+[latest release](https://github.com/vercel-labs/fx/releases/latest), extract it,
+and put `fx.exe` somewhere on `PATH`:
+
+```powershell
+Expand-Archive fx-windows-x86_64.zip -DestinationPath $env:LOCALAPPDATA\fx
+$env:PATH = "$env:LOCALAPPDATA\fx;$env:PATH"
+```
+
+Windows Terminal is recommended. fx turns on the console's ANSI interpreter
+itself, so `conhost` works too.
+
 ## Run fx
 
 To get started, sign in with Vercel:
@@ -94,6 +106,47 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 Run the test suite with `zig build test`. See [CONTRIBUTING.md](CONTRIBUTING.md) for development and contribution guidelines.
+
+The same commands build fx on Windows; the binary is `zig-out\bin\fx.exe`.
+
+### Platform support
+
+fx runs natively on macOS, Linux, and Windows x86_64. A few capabilities have no
+Windows equivalent yet and report themselves as unavailable rather than failing
+partway:
+
+| Capability | Windows |
+| --- | --- |
+| Interactive terminal UI, sessions, file and shell tools | Supported |
+| Stored credentials | Encrypted with DPAPI for the current Windows user, in place of POSIX mode bits |
+| Private state permissions | NTFS ACLs are inherited; POSIX mode bits are neither set nor verified |
+| Command cancellation and timeout | A job object terminates the whole child process tree, in place of a POSIX process group |
+| Shell tool | Commands run through `cmd /C` |
+| Background commands | Unavailable |
+| Hosted child terminals | Unavailable |
+| `web_fetch` | Unavailable; the pinned-address transport is written against POSIX sockets |
+| `fx upgrade` and auto-upgrade | Unavailable; install a new release manually |
+| OS sandbox | Unavailable, as on Linux |
+
+### Stored credentials
+
+`fx login` and `fx setup` keep credentials under `~/.fx`, and how they are
+protected follows what the platform provides without adding a dependency.
+
+- **macOS** stores the API key in the Keychain.
+- **Windows** encrypts both the signed-in session and the API key with DPAPI,
+  scoped to the current user, so the bytes on disk are useless to another
+  account. This replaces the `0600` file mode fx relies on elsewhere, which
+  Windows cannot enforce. Set `FX_DISABLE_DPAPI=1` to store them unencrypted.
+- **Linux** stores them in a `0600` profile file. The comparable service is
+  libsecret, which needs D-Bus and a running keyring daemon; fx targets
+  containers and agent sandboxes where neither is present, so there is no
+  option that works everywhere fx runs.
+
+A credential written before encryption existed still loads and is encrypted by
+the next write. Encryption never falls back to plaintext: if it fails, the write
+fails. A credential this account cannot decrypt is reported as unreadable, not as
+missing, so the fix is to run `fx login` or `fx setup` again.
 
 ## License
 
