@@ -5679,7 +5679,7 @@ test "disabled automatic reviewer returns a recoverable denial without a human p
         defer existing.close(io_mod.getIo());
         try existing.writeStreamingAll(io_mod.getIo(), "before");
     }
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"hello\"}}", .{target});
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":{f},\"content\":\"hello\"}}", .{std.json.fmt(target, .{})});
 
     const outcome = try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "external-write",
@@ -5808,7 +5808,7 @@ test "request tool permission denies semantic_search outside workspace target" {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const args = try std.fmt.allocPrint(arena, "{{\"query\":\"needle\",\"path\":\"{s}\"}}", .{external});
+    const args = try std.fmt.allocPrint(arena, "{{\"query\":\"needle\",\"path\":{f}}}", .{std.json.fmt(external, .{})});
 
     try std.testing.expectEqual(ToolPermissionDecision.policy_denied, (try tool_admission.requestPermissionOutcome(rt.context().admissionInput(), arena, .{
         .id = "semantic",
@@ -7825,7 +7825,7 @@ test "external absolute non-write tracked mutations capture resolved paths" {
 
     try writeTestFile(tmp.dir, "external/delete.txt", "delete\n");
     const delete_path = try std.fs.path.join(arena, &.{ external, "delete.txt" });
-    const delete_args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{delete_path});
+    const delete_args = try std.fmt.allocPrint(arena, "{{\"path\":{f}}}", .{std.json.fmt(delete_path, .{})});
     _ = try executeToolCall(rt.context(), arena, .{
         .id = "external-delete",
         .name = "delete_file",

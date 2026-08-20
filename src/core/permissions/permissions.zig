@@ -2339,14 +2339,14 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     const read_call: types.ToolCall = .{
         .id = "read",
         .name = "read_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f}}}", .{std.json.fmt(external_file, .{})}),
     };
     try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, read_call, .path_existing));
 
     const write_call: types.ToolCall = .{
         .id = "write",
         .name = "write_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"\"}}", .{external_new_file}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f},\"content\":\"\"}}", .{std.json.fmt(external_new_file, .{})}),
     };
     try std.testing.expectError(
         error.TypedFileMutationTargetRequired,
@@ -2356,7 +2356,7 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     const edit_call: types.ToolCall = .{
         .id = "edit",
         .name = "edit_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"old_string\":\"main\",\"new_string\":\"start\"}}", .{external_file}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f},\"old_string\":\"main\",\"new_string\":\"start\"}}", .{std.json.fmt(external_file, .{})}),
     };
     try std.testing.expectError(
         error.TypedFileMutationTargetRequired,
@@ -2366,28 +2366,28 @@ test "permissionTargetForCall resolves external absolute file tool targets" {
     const delete_call: types.ToolCall = .{
         .id = "delete",
         .name = "delete_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f}}}", .{std.json.fmt(external_file, .{})}),
     };
     try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, delete_call, .path_existing));
 
     const create_folder_call: types.ToolCall = .{
         .id = "mkdir",
         .name = "create_folder",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_new_dir}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f}}}", .{std.json.fmt(external_new_dir, .{})}),
     };
     try std.testing.expectEqualStrings(std.fs.path.dirname(external_new_dir).?, try permissionTargetForCall(arena, workspace, create_folder_call, .path_create_parent));
 
     const file_info_call: types.ToolCall = .{
         .id = "info",
         .name = "file_info",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f}}}", .{std.json.fmt(external_file, .{})}),
     };
     try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, file_info_call, .path_existing));
 
     const open_call: types.ToolCall = .{
         .id = "open",
         .name = "open_file",
-        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\"}}", .{external_file}),
+        .arguments_json = try std.fmt.allocPrint(arena, "{{\"path\":{f}}}", .{std.json.fmt(external_file, .{})}),
     };
     try std.testing.expectEqualStrings(external_file, try permissionTargetForCall(arena, workspace, open_call, .path_existing));
 }
@@ -2479,7 +2479,7 @@ test "command cwd accepts external paths without widening workspace-only search"
     const search_call = types.ToolCall{
         .id = "search",
         .name = "semantic_search",
-        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"query\":\"needle\",\"path\":\"{s}\"}}", .{shared}),
+        .arguments_json = try std.fmt.allocPrint(arena_state.allocator(), "{{\"query\":\"needle\",\"path\":{f}}}", .{std.json.fmt(shared, .{})}),
     };
     const search_target = try permissionTargetForCallInScope(arena_state.allocator(), active_scope, search_call, .path_optional_existing);
     try std.testing.expectEqualStrings(shared, search_target);

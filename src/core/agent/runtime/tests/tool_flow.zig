@@ -4911,7 +4911,7 @@ test "processQueuedPrompt once permission binds external mutation grants before 
 
     const link_path = try std.fs.path.join(arena, &.{ workspace, "link" });
     const requested = try std.fs.path.join(arena, &.{ link_path, "created.txt" });
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":{f},\"content\":\"x\"}}", .{std.json.fmt(requested, .{})});
     const calls = [_]ToolCall{toolCall("call_1", "write_file", args)};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -4977,7 +4977,7 @@ test "processQueuedPrompt always permission retains external mutation session gr
 
     const link_path = try std.fs.path.join(arena, &.{ workspace, "link" });
     const requested = try std.fs.path.join(arena, &.{ link_path, "created.txt" });
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
+    const args = try std.fmt.allocPrint(arena, "{{\"path\":{f},\"content\":\"x\"}}", .{std.json.fmt(requested, .{})});
     const calls = [_]ToolCall{toolCall("call_1", "write_file", args)};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
