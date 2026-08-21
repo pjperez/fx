@@ -118,6 +118,7 @@ partway:
 | Capability | Windows |
 | --- | --- |
 | Interactive terminal UI, sessions, file and shell tools | Supported |
+| Workspace-relative paths | Reported with `/`, as git does, so transcripts stay portable; absolute paths keep native separators |
 | Stored credentials | Encrypted with DPAPI for the current Windows user, in place of POSIX mode bits |
 | Private state permissions | NTFS ACLs are inherited; POSIX mode bits are neither set nor verified |
 | Command cancellation and timeout | A job object terminates the whole child process tree, in place of a POSIX process group |
