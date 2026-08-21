@@ -621,7 +621,9 @@ test "read_file trims leading and trailing whitespace" {
     }
     const path = try tmpPath(std.testing.allocator, tmp, "file.txt");
     defer std.testing.allocator.free(path);
-    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"  {s}  \"}}", .{path});
+    const padded = try std.fmt.allocPrint(std.testing.allocator, "  {s}  ", .{path});
+    defer std.testing.allocator.free(padded);
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":{f}}}", .{std.json.fmt(padded, .{})});
     defer std.testing.allocator.free(args);
 
     const result = try dispatchReadFile(std.testing.allocator, args);

@@ -1110,13 +1110,38 @@ pub fn ensurePathInsideWorkspace(workspace_root: []const u8, absolute: []const u
     if (!pathInside(workspace_root, absolute)) return error.PathOutsideWorkspace;
 }
 
+/// Workspace-relative paths are presentation and interchange strings rather
+/// than paths handed back to the operating system: they appear in transcripts,
+/// in `--json` output, and in diffs, and a session carries them across
+/// workspaces and machines. They therefore use a forward slash everywhere, the
+/// same convention git prints on Windows, so a transcript recorded on one
+/// platform still reads correctly on another and no separator has to survive
+/// JSON escaping. A path outside the workspace is returned unchanged, because
+/// that is a real filesystem path the reader may want to use verbatim.
 pub fn workspaceRelativePath(
     arena: std.mem.Allocator,
     workspace_root: []const u8,
     absolute: []const u8,
 ) ![]const u8 {
     if (!pathInside(workspace_root, absolute)) return arena.dupe(u8, absolute);
-    return std.fs.path.relative(arena, "/", null, workspace_root, absolute) catch try arena.dupe(u8, absolute);
+    const relative = std.fs.path.relative(
+        arena,
+        filesystemRoot(absolute),
+        null,
+        workspace_root,
+        absolute,
+    ) catch return arena.dupe(u8, absolute);
+    return toDisplaySeparators(relative);
+}
+
+/// Rewrites a relative path in place to the separator fx displays. POSIX
+/// already produces it, so this is a no-op there.
+pub fn toDisplaySeparators(relative: []u8) []u8 {
+    if (comptime @import("builtin").os.tag != .windows) return relative;
+    for (relative) |*byte| {
+        if (byte.* == '\\') byte.* = '/';
+    }
+    return relative;
 }
 
 pub fn ensureParentDirectories(path_abs: []const u8) !void {

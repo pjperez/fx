@@ -12,6 +12,7 @@ const usage_report = @import("../session/usage_report.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
+const pathing = @import("../workspace/pathing.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 
 const Allocator = std.mem.Allocator;
@@ -1479,7 +1480,14 @@ fn displayGrantTarget(alloc: Allocator, workspace_root: []const u8, grant: types
     }
 
     if (std.fs.path.isAbsolute(grant.target_path)) {
-        return std.fs.path.relative(alloc, "/", null, workspace_root, grant.target_path) catch alloc.dupe(u8, grant.target_path);
+        const relative = std.fs.path.relative(
+            alloc,
+            pathing.filesystemRoot(grant.target_path),
+            null,
+            workspace_root,
+            grant.target_path,
+        ) catch return alloc.dupe(u8, grant.target_path);
+        return pathing.toDisplaySeparators(relative);
     }
 
     return alloc.dupe(u8, grant.target_path);

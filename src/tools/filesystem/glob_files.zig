@@ -330,7 +330,9 @@ fn joinRelativeSearchPath(arena: Allocator, root_relative: []const u8, child_rel
     if (std.mem.eql(u8, root_relative, ".") or root_relative.len == 0) {
         return arena.dupe(u8, child_relative);
     }
-    return std.fs.path.join(arena, &.{ root_relative, child_relative });
+    // These paths are reported to the caller rather than reopened, so they carry
+    // the separator fx displays instead of the platform's.
+    return pathing.toDisplaySeparators(try std.fs.path.join(arena, &.{ root_relative, child_relative }));
 }
 
 fn shouldIncludeHidden(root_relative: []const u8, pattern: []const u8) bool {

@@ -1535,12 +1535,12 @@ pub fn permissionRulePatternForGrant(alloc: std.mem.Allocator, workspace_root: [
     if (std.fs.path.isAbsolute(pattern) and pathing.pathInside(workspace_root, pattern)) {
         if (directoryTreePatternMatches(pattern, workspace_root)) return alloc.dupe(u8, "*");
 
-        const relative = std.fs.path.relative(alloc, "/", null, workspace_root, pattern) catch return alloc.dupe(u8, pattern);
+        const relative = std.fs.path.relative(alloc, pathing.filesystemRoot(pattern), null, workspace_root, pattern) catch return alloc.dupe(u8, pattern);
         if (relative.len == 0) {
             alloc.free(relative);
             return alloc.dupe(u8, "*");
         }
-        return relative;
+        return pathing.toDisplaySeparators(relative);
     }
 
     return alloc.dupe(u8, pattern);
@@ -1873,12 +1873,12 @@ fn hostFromAuthority(authority: []const u8) ?[]const u8 {
 
 fn displayPathTarget(alloc: std.mem.Allocator, workspace_root: []const u8, target_path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(target_path) and pathing.pathInside(workspace_root, target_path)) {
-        const relative = std.fs.path.relative(alloc, "/", null, workspace_root, target_path) catch return alloc.dupe(u8, target_path);
+        const relative = std.fs.path.relative(alloc, pathing.filesystemRoot(target_path), null, workspace_root, target_path) catch return alloc.dupe(u8, target_path);
         if (relative.len == 0) {
             alloc.free(relative);
             return alloc.dupe(u8, ".");
         }
-        return relative;
+        return pathing.toDisplaySeparators(relative);
     }
     return alloc.dupe(u8, target_path);
 }
@@ -1893,7 +1893,7 @@ fn displayCommandTarget(alloc: std.mem.Allocator, workspace_root: []const u8, ta
     const display_cwd = try (if (std.mem.eql(u8, cwd, workspace_root))
         alloc.dupe(u8, ".")
     else if (std.fs.path.isAbsolute(cwd) and pathing.pathInside(workspace_root, cwd))
-        (std.fs.path.relative(alloc, "/", null, workspace_root, cwd) catch alloc.dupe(u8, cwd))
+        (pathing.toDisplaySeparators(std.fs.path.relative(alloc, pathing.filesystemRoot(cwd), null, workspace_root, cwd) catch return alloc.dupe(u8, cwd)))
     else
         alloc.dupe(u8, cwd));
     defer alloc.free(display_cwd);
